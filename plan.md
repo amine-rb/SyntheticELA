@@ -426,6 +426,23 @@ INDICATIVE SEULEMENT :
   Pixel AUROC     # gonflé par le déséquilibre pixel, ne pas en faire l'argument central
 ```
 
+### Rôle de chaque métrique
+
+| Catégorie | Métrique | Rôle |
+| --- | --- | --- |
+| Principale (threshold-free) | **Pixel AUPRC** | Robuste au déséquilibre pixel (zones falsifiées minuscules vs document). Métrique de pilotage de l'early stopping (§9.3bis) et de sélection dans toutes les ablations. |
+| Principale (threshold-free) | **AUPRO** | Per-region overlap : évite qu'une grosse région détectée compense de nombreuses petites régions ratées. |
+| Opérationnelle (seuil figé) | **Dice** | Qualité du masque binaire prédit. |
+| Opérationnelle (seuil figé) | **IoU** | Complémentaire du Dice sur le masque binaire. |
+| Opérationnelle (seuil figé) | **FPR authentiques** | Point critique industriel : faux positifs sur logos/tampons/éléments saillants (problème d'origine du B-CNN, cf. §14 et E7). |
+| Globale | **Image AUROC** | Décision document falsifié/authentique. Sur le test réel 50/50, la plus solide statistiquement (100 points au niveau document). |
+| Indicative | **Pixel AUROC** | Gonflée mécaniquement par le déséquilibre pixel. Reportée par transparence, jamais comme argument central. |
+
+> Usage pratique : sélection/comparaison en **Pixel AUPRC** (dev synthétique) ; contribution défendue
+> avec **AUPRC + AUPRO + IC** ; utilisabilité montrée avec **Dice/IoU/FPR au seuil figé** ; robustesse
+> statistique ancrée par l'**Image AUROC** sur le test réel. Format du tableau livrable :
+> `Expérience | Représentation | AUPRC | AUPRO | Dice | IoU | FPR authentique | Commentaire`.
+
 ## 9.5 Intervalles de confiance
 ```text
 bootstrap non paramétrique au niveau document
