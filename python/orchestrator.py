@@ -67,6 +67,7 @@ class Job:
     alignment: Optional[str]
     donor_path: Optional[str]       # splice uniquement
     q1: Optional[int] = None        # None = mode natif (Q0 lu) ; sinon Q1 contrôlé
+    n_forgeries: int = 1            # nb de falsifications (même type) sur ce doc positif
 
 
 # ------------------------------------------------------------------ planning
@@ -120,7 +121,11 @@ def plan_jobs(cfg: dict, source_paths: list[str], edit_type: str,
     q1_sweep = cfg["compression"].get("q1_sweep", [])
     neg_ratio = float(cfg["negatives"]["ratio"])
     aligned_ratio = float(cfg["forger"]["aligned_ratio"])
+    # size_classes ORDONNÉES du plus petit au plus grand (ordre du config).
     size_classes = list(cfg["size_classes"].keys())
+    # Nombre de falsifications par doc positif : k ~ U{n_min..n_max} (même type).
+    n_min, n_max = (list(cfg["forger"].get("n_forgeries", [1, 1])) + [1])[:2]
+    n_min, n_max = int(n_min), int(max(int(n_min), int(n_max)))
 
     jobs: list[Job] = []
     for i in range(n_docs):
@@ -135,7 +140,11 @@ def plan_jobs(cfg: dict, source_paths: list[str], edit_type: str,
             q1 = int(q1_sweep[(i // len(q2_sweep)) % len(q1_sweep)])
         source_path = str(master.choice(source_paths))
         is_negative = bool(master.random() < neg_ratio)
-        doc_id = f"{doc_prefix}_{i:06d}"
+        # Nommage HONNÊTE : un négatif n'est PAS une falsification du type courant.
+        # Il porte le marqueur `authentic` (mais garde le préfixe du dossier pour
+        # rester unique à l'agrégation) -> plus de "substitution_XXXX" à masque vide.
+        doc_id = (f"{doc_prefix}_authentic_{i:06d}" if is_negative
+                  else f"{doc_prefix}_{i:06d}")
 
         if is_negative:
             jobs.append(Job(
@@ -145,7 +154,12 @@ def plan_jobs(cfg: dict, source_paths: list[str], edit_type: str,
             ))
             continue
 
-        size_class = str(size_classes[int(jrng.integers(0, len(size_classes)))])
+        # Nombre de falsifications sur ce doc, puis PLAFOND de taille selon k :
+        # plus il y en a, plus elles sont petites (évite de couvrir toute la page).
+        #   k=1 -> toutes tailles ... k>=len(classes) -> small only.
+        k = int(jrng.integers(n_min, n_max + 1))
+        max_idx = min(len(size_classes) - 1, max(0, len(size_classes) - k))
+        size_class = str(size_classes[int(jrng.integers(0, max_idx + 1))])
 
         if edit_type == "substitution":
             alignment = "N/A"
@@ -161,7 +175,7 @@ def plan_jobs(cfg: dict, source_paths: list[str], edit_type: str,
         jobs.append(Job(
             doc_id=doc_id, seed=seed, q2=q2, is_negative=False,
             source_path=source_path, edit_type=edit_type, size_class=size_class,
-            alignment=alignment, donor_path=donor_path, q1=q1,
+            alignment=alignment, donor_path=donor_path, q1=q1, n_forgeries=k,
         ))
     return jobs
 
@@ -183,6 +197,7 @@ def _run_job(job: Job, cfg: dict, out_dirs: dict, nonstd_thr: float) -> dict:
         base_rgb = recompress_to_q1(src.rgb, job.q1, subsampling=DEFAULT_Q2_SUBSAMPLING)
     q1_effective = job.q1 if job.q1 is not None else src.q0
 
+    forgery_bboxes: list = []
     if job.is_negative:
         edited = base_rgb
         mask = np.zeros((src.height, src.width), dtype=np.uint8)
@@ -206,18 +221,28 @@ def _run_job(job: Job, cfg: dict, out_dirs: dict, nonstd_thr: float) -> dict:
             # (donneur JPEG : historique natif Q0 conservé, déjà étranger au fond.)
         # int (carré) ou [largeur_min, hauteur_min] ; normalisé dans forger.forge().
         min_region_px = cfg["forger"].get("min_region_px", forger_mod.JPEG_BLOCK)
-        forge_res = forger_mod.forge(
-            img=base_rgb, edit_type=job.edit_type, size_class=job.size_class,
-            area_range=area_range, alignment=job.alignment,
-            feather_range=feather_range, rng=rng,
-            donor=donor_rgb, donor_id=donor_id,
-            min_region_px=min_region_px,
-        )
+
+        # ---- k falsifications (MÊME type, MÊME classe de taille) accumulées ----
+        # Chaque passe édite l'image courante et évite les zones déjà falsifiées
+        # (forbid). Le masque final est l'UNION des k empreintes.
+        edited = base_rgb
+        mask = np.zeros((src.height, src.width), dtype=np.uint8)
+        forge_res = None
+        for _ in range(max(1, job.n_forgeries)):
+            forge_res = forger_mod.forge(
+                img=edited, edit_type=job.edit_type, size_class=job.size_class,
+                area_range=area_range, alignment=job.alignment,
+                feather_range=feather_range, rng=rng,
+                donor=donor_rgb, donor_id=donor_id,
+                min_region_px=min_region_px, forbid=forgery_bboxes,
+            )
+            edited = forge_res.image
+            mask = np.maximum(mask, forge_res.mask)
+            forgery_bboxes.append(forge_res.bbox)      # évite le chevauchement suivant
         if donor_q is not None:
             forge_res.extra["donor_q"] = donor_q   # qualité JPEG étrangère du splice
-        edited, mask = forge_res.image, forge_res.mask
         edit_type, size_class, alignment = job.edit_type, job.size_class, job.alignment
-        bbox = ann.bbox_from_mask(mask)
+        bbox = ann.bbox_from_mask(mask)            # bbox englobante de l'UNION
 
     # ---- Passe Q2 UNIQUE sur l'image composite entière (règle impérative) ----
     img_path = os.path.join(out_dirs["data"], f"{job.doc_id}.jpg")
@@ -244,6 +269,10 @@ def _run_job(job: Job, cfg: dict, out_dirs: dict, nonstd_thr: float) -> dict:
     )
     meta["Q1_mode"] = "controlled" if job.q1 is not None else "native"
     meta["Q1_effective"] = int(q1_effective)   # historique effectif du fond (vs Q2)
+    # Multi-falsification : nb de zones + bbox de CHACUNE (le champ `bbox` est
+    # l'englobante de l'union, coarse ; ici la vérité région par région).
+    meta["n_forgeries"] = 0 if job.is_negative else int(job.n_forgeries)
+    meta["forgery_bboxes"] = forgery_bboxes
     meta["patch_grid"] = labels.tolist()
     meta["files"] = {"image": os.path.basename(img_path),
                      "mask": os.path.basename(mask_path)}
@@ -265,6 +294,7 @@ def _run_job(job: Job, cfg: dict, out_dirs: dict, nonstd_thr: float) -> dict:
         "size_class": size_class,
         "alignment": alignment,
         "is_negative": job.is_negative,
+        "n_forgeries": 0 if job.is_negative else int(job.n_forgeries),
         "bbox_x": bbox[0] if bbox else -1,
         "bbox_y": bbox[1] if bbox else -1,
         "bbox_w": bbox[2] if bbox else -1,
@@ -420,7 +450,7 @@ def run(cfg: dict, limit: Optional[int] = None, workers: Optional[int] = None) -
 
     print(f"[4/4] {len(edit_types)} sous-dossier(s) sous {out_root}/ : "
           f"{', '.join(edit_types)}")
-    print(f"      Agréger : ./aggregate.sh --out {out_root}")
+    print(f"      Agréger : ./scripts/aggregate.sh")
     return {"output_dir": out_root, "edit_types": edit_types,
             "distribution": os.path.join(out_root, "distribution.json"),
             "batches": results}
@@ -436,6 +466,9 @@ def _print_batch_summary(rows: list[dict]) -> None:
     print(f"  Types          : {dict(Counter(r['type'] for r in rows))}")
     print(f"  Alignement     : {dict(Counter(r['alignment'] for r in rows))}")
     print(f"  Tailles        : {dict(Counter(r['size_class'] for r in rows))}")
+    pos = [r for r in rows if not r["is_negative"]]
+    if pos:
+        print(f"  Falsif./doc    : {dict(sorted(Counter(r['n_forgeries'] for r in pos).items()))}")
     print(f"  Q2             : {dict(Counter(r['q2'] for r in rows))}")
     print("=" * 64)
 

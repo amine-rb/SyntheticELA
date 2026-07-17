@@ -74,7 +74,7 @@ def aggregate(out_root: str, types: list[str] | None = None,
     if not types:
         raise RuntimeError(
             f"Aucun sous-dossier de type avec manifeste sous {out_root} "
-            "(lance d'abord `python orchestrator.py` ou `./run.sh`).")
+            "(lance d'abord `./scripts/run.sh`).")
 
     dest_root = os.path.join(out_root, dest)
     os.makedirs(os.path.join(dest_root, "data"), exist_ok=True)

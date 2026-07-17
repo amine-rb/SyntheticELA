@@ -1,14 +1,35 @@
-# SyntheticEla — Générateur de falsifications documentaires annotées
+# SyntheticEla — Générateur de falsifications documentaires annotées + évaluation
 
 Génère un dataset **synthétique de falsifications documentaires annotées au pixel**
-à partir de n'importe quel corpus d'images de documents authentiques. Reproduit le
-scénario forensique de **double compression JPEG** (un fraudeur modifie un document
-déjà enregistré, puis le resauvegarde) et fournit, pour chaque document, le masque
-exact, une grille de labels patch, et les métadonnées.
+à partir de n'importe quel corpus d'images de documents authentiques, et fournit le
+module d'**évaluation détection/localisation** (AnoViT) associé.
 
-Conçu pour être **réutilisable et configurable** : un seul fichier de config,
-des scripts plats à la racine (pas de package Python), et le pipeline s'adapte
-au type de corpus (JPEG ou lossless).
+Reproduit le scénario forensique de **double compression JPEG** — un fraudeur modifie
+un document déjà enregistré, puis le resauvegarde — et fournit, pour chaque document,
+le masque exact, une grille de labels patch, et les métadonnées.
+
+Interface volontairement minimale : **un seul fichier à éditer (`config.sh`)**,
+**trois commandes à lancer (`scripts/*.sh`)**.
+
+---
+
+## 0. Organisation du dépôt
+
+```
+config.sh          <- LE seul fichier à éditer (tous les paramètres)
+scripts/           <- LES seules commandes à lancer
+   run.sh          - génération (un sous-dossier autonome par type)
+   aggregate.sh    - fusion des sous-dossiers de types -> _aggregated/
+   preview.sh      - planches QA image | ELA | masque
+   _common.sh      - interne (charge config.sh, génère la config, localise python)
+python/            <- code (10 modules ; usage normal = ne pas toucher)
+markdown/          <- plan de recherche, schéma roadmap, notes
+requirements.txt
+README.md          <- ce fichier
+```
+
+Aucun package Python : les modules de `python/` sont des fichiers plats, rendus
+importables via `PYTHONPATH` par les scripts (compatible workers *spawn* macOS).
 
 ---
 
@@ -17,183 +38,255 @@ au type de corpus (JPEG ou lossless).
 ```bash
 pip install -r requirements.txt   # Pillow, NumPy, OpenCV, PyYAML, PyArrow
 ```
+Pour l'évaluation (§11) uniquement : `pip install torch scikit-learn scipy`.
 
-## 2. Démarrage rapide (n'importe quel dataset)
+---
 
-Tout se pilote depuis `config.yaml` (`paths.source_dir`, `paths.output_dir`,
-`forger.edit_types`, `orchestrator.n_docs`, ...). Édite-le, puis lance :
+## 2. Démarrage rapide
+
+Deux étapes :
+
+1. **Édite `config.sh`** — au minimum `SOURCE_DIR` et `OUTPUT_DIR` ; puis `EDIT_TYPES`,
+   `N_DOCS`, `N_FORGERIES`, `MIN_REGION_PX`, `NEGATIVES_RATIO`… **tout** y est.
+2. **Lance** :
 
 ```bash
-./run.sh                                    # tout vient de config.yaml
+./scripts/run.sh          # génère un sous-dossier autonome par type d'édition
+./scripts/aggregate.sh    # (option) fusionne -> OUTPUT_DIR/_aggregated/
+./scripts/preview.sh      # (option) planches QA du 1er type
 ```
 
-Ou surcharge ponctuellement en ligne de commande (sans toucher au fichier) :
+Surcharge ponctuelle en CLI, sans éditer `config.sh` :
 
 ```bash
-# Génération : UN SOUS-DOSSIER par type d'édition (config forger.edit_types).
-# Le pipeline sonde le corpus et choisit tout seul le mode de compression.
-./run.sh --src <DOSSIER_IMAGES> --out <DOSSIER_SORTIE> --n 1000
-#   -> <DOSSIER_SORTIE>/substitution/ , /copy_move/ , /splice/  (chacun autonome)
-
-# (option) Fusionner les sous-dossiers en un dataset unique
-./aggregate.sh --out <DOSSIER_SORTIE>                # -> <...>/_aggregated/
-
-# Planches de contrôle visuel (image | ELA | masque) sur un sous-dossier donné
-./preview.sh   --out <DOSSIER_SORTIE>/_aggregated
+./scripts/run.sh --src AUTRE/DOSSIER --out AUTRE/SORTIE --n 500 --workers 8
+./scripts/aggregate.sh --types substitution splice --mode symlink
+./scripts/preview.sh --out "$OUTPUT_DIR/_aggregated" --n 20
 ```
 
-Exemples :
-```bash
-./run.sh --src SROIE2019/train/img --out output          --n 2000
-./run.sh --src StaVer/scans/scans  --out output_staver   --n 1000
-```
+Sources JPEG **ou** PNG : le mode de compression est choisi automatiquement (§7).
+Chaque run écrit un **`REPORT.md`** qui explique ses résultats (§6).
 
-Rien d'autre à configurer : sources JPEG **ou** PNG, le mode de compression est
-choisi automatiquement (§6). Chaque run écrit un **`REPORT.md`** qui explique ses
-résultats (§5).
+---
 
-> Équivalent direct sans les `.sh` (même effet, un seul point d'entrée
-> `main.py`) : `python main.py --src ... --out ... --n ...`.
-
-## 3. Ce que fait le pipeline (chaîne forensique)
+## 3. Chaîne forensique
 
 ```
 source (Q0 lu si JPEG, sinon lossless)
    └─[si controlled] recompression unique à Q1   ── fond = historique Q1
-        └─ forger : substitution / copy_move / splice   (édition en espace pixel)
-             └─ recompress : UNE SEULE passe JPEG Q2     ← unique compression finale
+        └─ forger : k falsifications (même type) en espace pixel
+             └─ recompress : UNE SEULE passe JPEG Q2   ← unique compression finale
                   └─ annotator : masque exact + bbox + grille patch 24×24 + JSON
 ```
 
-Point clé : la zone éditée subit **la même passe Q2 que le fond** — rien n'est
-collé après le save final. C'est ce qui crée une vraie **incohérence d'historique
-de compression** entre la zone falsifiée et le reste du document, que l'ELA révèle.
+Point clé : la (les) zone(s) éditée(s) subissent **la même passe Q2 que le fond** —
+rien n'est collé après le save final. C'est ce qui crée une vraie **incohérence
+d'historique de compression** entre les zones falsifiées et le reste du document,
+que l'ELA révèle.
 
 Trois types d'édition :
 - **substitution** — pixels neufs peints (texte) : pas de grille 8×8 antérieure (`alignment = N/A`).
 - **copy_move** — région recopiée de la même image (porte la grille Q1) ; offset ×8 → aligné, sinon désaligné.
 - **splice** — région d'un autre document du corpus (grille étrangère) ; même contrôle d'alignement.
 
-## 4. Sorties (un sous-dossier AUTONOME par type)
+---
 
-Chaque type demandé dans `forger.edit_types` produit un sous-dossier complet et
-indépendant (il ne manque aucune info pour l'entraînement/évaluation en aval) :
+## 4. Falsifications multiples & taille minimale
+
+**Plusieurs falsifications par document** (`N_FORGERIES=(min max)`). Chaque document
+positif reçoit `k ~ U{min..max}` falsifications du **même type**, aux empreintes
+**disjointes** (pas de chevauchement), et le masque final est leur **union**.
+
+**Plafond de taille automatique selon `k`** : plus il y a de falsifications, plus
+elles sont petites, pour ne jamais couvrir toute la page. Concrètement (4 classes de
+taille ordonnées) :
+
+| `k` | classes de taille autorisées |
+| --- | --- |
+| 1   | small · medium · large · very_large |
+| 2   | small · medium · large |
+| 3   | small · medium |
+| 4   | small |
+| 5   | small |
+
+**Taille minimale garantie** (`MIN_REGION_PX=(largeur hauteur)`) : plancher du
+rectangle falsifié quel que soit la classe ou l'image source, arrondi au **multiple de
+8 supérieur** (grille JPEG) — `(10 10)` ⇒ minimum réel `16×16`. Si une source est trop
+petite pour l'accueillir sur un axe, le document **échoue proprement** (erreur
+journalisée par l'orchestrator) au lieu d'écrire un positif à **masque vide**.
+
+---
+
+## 5. Sorties (un sous-dossier AUTONOME par type)
+
+Chaque type de `EDIT_TYPES` produit un sous-dossier complet et indépendant (il ne
+manque aucune info pour l'entraînement/évaluation en aval) :
 
 ```
 <out>/distribution.json          # sonde du corpus source (commune à tous les types)
 <out>/<type>/                     # ex. substitution / copy_move / splice
-     data/<type>_<id>.jpg         # document final (fond Q1->Q2, zone incohérente)
-     data/<type>_<id>_mask.png    # masque binaire pixel EXACT (sans dilatation)
-     data/<type>_<id>.json        # Q0, Q1, Q2, type, taille, alignement, bbox, seed, grille 24x24
+     data/<type>_<id>.jpg         # document final (fond Q1->Q2, zones incohérentes)
+     data/<type>_<id>_mask.png    # masque binaire pixel EXACT (union des k zones)
+     data/<type>_<id>.json        # Q0/Q1/Q2, type, taille, alignement, n_forgeries, bboxes, seed, grille 24x24
      manifest.parquet             # table du sous-dossier (une ligne par document)
      distribution.json            # sonde du corpus (copie, self-contained)
-     run_config.yaml              # config effective figée (dont edit_type)
-     REPORT.md                    # rapport lisible des résultats  ← §5
-     ela_preview/                 # planches QA (après `./preview.sh --out <sous-dossier>`)
+     run_config.yaml              # config effective figée
+     REPORT.md                    # rapport lisible des résultats  ← §6
+     ela_preview/                 # planches QA (après ./scripts/preview.sh)
 ```
 
-Les `id` sont **préfixés par le type** → uniques globalement. `./aggregate.sh`
+Les négatifs (authentiques, masque vide) portent le marqueur `authentic` dans leur
+nom (`<type>_authentic_<id>`) : jamais de « falsification » à masque vide.
+
+Les `id` sont **préfixés par le type** → uniques globalement. `./scripts/aggregate.sh`
 réunit les sous-dossiers choisis dans `<out>/_aggregated/` (même structure, manifeste
 concaténé, colonne `type` re-filtrable). Options : `--types t1 t2`, `--dest NOM`,
 `--mode copy|symlink|hardlink` (symlink/hardlink = pas de duplication disque).
 
 Colonnes du manifeste : `id, source_id, q0, q0_nonstandard, q1_mode, q1_effective,
-q2, type, size_class, alignment, is_negative, bbox_x/y/w/h, n_mask_px, mask_frac,
-n_pos_patches, subsampling_src, seed, path_img, path_mask, path_json`.
+q2, type, size_class, alignment, is_negative, n_forgeries, bbox_x/y/w/h, n_mask_px,
+mask_frac, n_pos_patches, subsampling_src, seed, path_img, path_mask, path_json`.
+(`bbox_*` = englobante de l'union ; les bbox individuelles sont dans le JSON,
+champ `forgery_bboxes`.)
 
-## 5. `REPORT.md` — les résultats de chaque run
+---
 
-Généré automatiquement à la fin de chaque génération (et regénérable seul :
-`python reporter.py --out <DOSSIER_SORTIE>`). Il contient :
+## 6. `REPORT.md` — les résultats de chaque run
+
+Généré automatiquement à la fin de chaque génération (regénérable seul :
+`python python/reporter.py --out <SOUS-DOSSIER>`). Il contient :
 
 1. **Source & config** (corpus, seed, mode Q1 choisi, sweeps, Q0/dimensions),
 2. **Composition** (types, tailles, alignement, négatifs, Q1, Q2),
 3. **Couverture des régimes Q1/Q2** pour l'ablation robustesse (Q1<Q2 / Q1=Q2 / Q1>Q2),
 4. **Contrôles d'intégrité** (masques positifs/négatifs cohérents, surface par taille),
 5. **Signal ELA échantillonné** : ratio moyen ELA intérieur/extérieur du masque, par
-   type × régime — c'est la mesure « le signal falsifié ressort-il ? ».
+   type × régime — la mesure « le signal falsifié ressort-il ? ».
 
-## 6. Mode de compression Q1 (auto, adaptatif)
+---
 
-Le paramètre `compression.q1_mode` :
+## 7. Mode de compression Q1 (auto, adaptatif)
+
+`Q1_MODE` (config.sh) :
 
 | Valeur | Comportement |
 | --- | --- |
 | `native` | garde Q0 (scénario réaliste). Adapté à un corpus JPEG à Q0 varié/modéré. |
 | `controlled` | impose Q1 par recompression → fond réellement double-compressé Q1→Q2. |
-| `auto` *(défaut)* | décide seul et **journalise** le choix : lossless **ou** Q0 médian ≥ `q1_auto_q0_threshold` (95) → `controlled` ; sinon `native`. |
+| `auto` *(défaut)* | décide seul et **journalise** : lossless **ou** Q0 médian ≥ `Q1_AUTO_Q0_THRESHOLD` (95) → `controlled` ; sinon `native`. |
 
-Pourquoi `auto` bascule en `controlled` pour les corpus lossless (PNG) ou quasi
-sans perte (Q0≈100) — **mesuré**, pas supposé (ratio ELA dans/hors masque) :
+Pourquoi `auto` bascule en `controlled` pour un corpus lossless (PNG) ou quasi sans
+perte (Q0≈100) — **mesuré**, pas supposé (ratio ELA dans/hors masque) :
 
 | type | native (Q0≈100) | controlled Q1<Q2 | controlled Q1>Q2 |
 | --- | --- | --- | --- |
-| splice        | 1.41 | **5.68** | 1.91 |
-| copy_move     | 1.40 | **1.69** | 1.18 |
+| splice    | 1.41 | **5.68** | 1.91 |
+| copy_move | 1.40 | **1.69** | 1.18 |
 
-En native sur un corpus Q0≈100, le fond n'est quasi pas double-compressé → signal
-copy_move/splice faible. En controlled, le fond devient réellement double-compressé
-et le signal devient net **et dépendant du régime** (le cas Q2<Q1 écrase le signal,
-limite physique attendue). `q1_sweep ⊆ q2_sweep` garantit la couverture des trois
-régimes. Q0 reste toujours **lu et journalisé**, jamais réinventé.
+En native sur Q0≈100, le fond n'est quasi pas double-compressé → signal faible. En
+controlled, le fond devient réellement double-compressé et le signal net **et dépendant
+du régime** (Q2<Q1 écrase le signal, limite physique attendue). `Q1_SWEEP ⊆ Q2_SWEEP`
+garantit la couverture des trois régimes. Q0 reste toujours **lu et journalisé**.
 
 > Un corpus PNG **doit** utiliser `controlled` (pas de Q0) : le pipeline le force et
 > lève une erreur explicite si on demande `native`.
 
-## 7. Configuration (`config.yaml`)
+---
 
-Tous les défauts sont dans `config.yaml`, commentés. Principaux réglages :
+## 8. Configuration (`config.sh`)
 
-| Section | Clés | Rôle |
-| --- | --- | --- |
-| `paths` | `source_dir`, `output_dir` | corpus & sortie (surchargés par `--src` / `--out`) |
-| `probe` | `candidate_ext`, `allow_lossless` | extensions acceptées, prise en charge lossless |
-| `compression` | `q2_sweep`, `q1_mode`, `q1_sweep`, `q1_auto_q0_threshold` | balayage de compression |
-| `forger` | `edit_types`, `aligned_ratio`, `feather_radius_px`, `min_region_px` | types générés (1 sous-dossier/type), taille min garantie |
-| `size_classes` | small…very_large | tailles de zone (fraction de page, ×8 px) |
-| `negatives` | `ratio` | part d'authentiques (masque vide), **par sous-dossier** |
-| `annotator` | `patch_size`, `patch_grid`, `patch_positive_overlap` | grille patch |
-| `orchestrator` | `seed`, `n_docs`, `n_workers` | lot **par type** & parallélisme |
+**Tous** les paramètres sont là (variables shell commentées) — seul fichier à éditer.
 
-Surcharges CLI : `--src`, `--out`, `--n`, `--workers`, `--config`.
+| Variable(s) | Rôle |
+| --- | --- |
+| `SOURCE_DIR`, `OUTPUT_DIR` | corpus source & racine de sortie |
+| `CANDIDATE_EXT`, `ALLOW_LOSSLESS` | extensions acceptées, prise en charge lossless (PNG) |
+| `Q2_SWEEP`, `Q1_MODE`, `Q1_SWEEP`, `Q1_AUTO_Q0_THRESHOLD` | balayage de compression |
+| `EDIT_TYPES` | types générés — **un sous-dossier par type** |
+| `N_FORGERIES` | `(min max)` falsifications par doc — plafond de taille auto (§4) |
+| `MIN_REGION_PX` | `(largeur hauteur)` taille min garantie de zone (§4) |
+| `ALIGNED_RATIO`, `FEATHER_RADIUS_PX` | alignement grille 8×8, adoucissement anti-tell |
+| `SIZE_SMALL … SIZE_VERY_LARGE` | tailles de zone (fraction de page, min max) |
+| `NEGATIVES_RATIO` | part d'authentiques par sous-dossier (`0.0` = que des fraudes) |
+| `INPUT_RES`, `PATCH_SIZE`, `PATCH_GRID`, `PATCH_POSITIVE_OVERLAP` | grille patch |
+| `ELA_QUALITY`, `ELA_N_SAMPLES` | QA visuel |
+| `SEED`, `N_DOCS`, `N_WORKERS` | reproductibilité, lot **par type**, parallélisme |
+| `PYTHON` | interpréteur (celui qui a les dépendances) |
 
-### `forger.min_region_px` — taille minimale garantie
+Surcharges CLI (sans éditer `config.sh`) : `--src`, `--out`, `--n`, `--workers`.
 
-```yaml
-forger:
-  min_region_px: [10, 10]   # [largeur_min, hauteur_min] px ; ou un entier (carré)
-```
+---
 
-Plancher **garanti** du rectangle falsifié (substitution/copy_move/splice), quel
-que soit `size_class` ou la taille de l'image source. Arrondi au **multiple de 8
-supérieur** (grille JPEG) : `[10, 10]` donne donc un minimum réel de `16×16`,
-jamais moins que demandé. Empêche les masques à 0 pixel sur des corpus à images
-très petites (miniatures, crops) : si une source ne peut pas accueillir ce
-minimum sur un axe, le document échoue proprement (erreur journalisée par
-`orchestrator`, jamais écrit comme positif à masque vide).
-
-## 8. Modules (racine du projet, un fichier par module — pas de package)
-
-Aucun `import src...` : tous les scripts sont des fichiers plats à la racine,
-appelables directement (`python module.py`) ou via `python -m module` (compatible).
+## 9. Code (`python/`, un fichier par module)
 
 | Module | Rôle |
 | --- | --- |
 | `jpeg_probe`  | Sonde Q0 / table quant / subsampling / dimensions (ou marque lossless) → `distribution.json`. |
 | `recompress`  | Décode la source ; `recompress_to_q1` (mode contrôlé) ; `save_q2` (passe Q2 unique). |
-| `forger`      | substitution / copy_move / splice ; feather anti-tell ; cohérence photométrique ; taille min garantie. |
+| `forger`      | substitution / copy_move / splice ; multi-falsification ; feather anti-tell ; taille min garantie. |
 | `annotator`   | Masque exact, bbox, grille patch 24×24, métadonnées JSON. |
 | `orchestrator`| Batch scriptable, un sous-dossier autonome par type, seeds déterministes, mode Q1 auto, manifeste. |
-| `aggregate`   | Fusionne les sous-dossiers de types en un dataset unique (`_aggregated/`), copy/symlink/hardlink. |
+| `aggregate`   | Fusionne les sous-dossiers de types en un dataset unique (`_aggregated/`). |
 | `reporter`    | `REPORT.md` (résultats du run + séparabilité ELA). |
 | `ela_preview` | Planches QA image \| ELA \| masque (ELA à une qualité distincte de Q2). |
-| `main`        | Point d'entrée unique (`python main.py` = `./run.sh`). |
+| `main`        | Point d'entrée appelé par `run.sh`. |
+| `detection_eval` | Évaluation détection/localisation AnoViT (§11) — à copier dans le codebase d'entraînement. |
 
-Wrappers shell (mêmes options que les scripts Python, lisent `config.yaml`) :
-`run.sh` (génération), `aggregate.sh` (fusion), `preview.sh` (QA visuel).
+---
 
-## 9. Reproductibilité
+## 10. Reproductibilité
 
 - Seed global → **seed déterministe par document** (journalisé). Sortie **identique**
-  quel que soit le nombre de workers (vérifié bit-à-bit).
+  quel que soit le nombre de workers (chaque job forge avec son propre seed).
+- Chaque type reçoit un flux aléatoire décorrélé → aucun doublon exact entre
+  sous-dossiers à l'agrégation.
 - `run_config.yaml` fige la config effective (dont le mode Q1 résolu) de chaque lot.
+
+---
+
+## 11. Évaluation détection/localisation (`python/detection_eval.py`)
+
+Module autonome à **copier dans le codebase d'entraînement** d'AnoViT. Implémente le
+protocole du mémoire (voir `markdown/plan.md` §9.3 seuil, §9.3bis pilotage, §9.4
+métriques). Dépendances supplémentaires : `torch, scikit-learn, scipy`.
+
+**Cache ELA (une fois, hors entraînement).** ELA à résolution native → échelle globale
+fixe → resize 384 → PNG gris (jamais JPEG). Une passe sert E0/E1 (1 qualité) et E2 (3) :
+
+```python
+from detection_eval import build_ela_cache
+build_ela_cache("<out>/_aggregated/data", "cache/dev",  qualities=(75, 85, 90, 95))
+build_ela_cache("chemin/authentiques",    "cache/auth", qualities=(75, 85, 90, 95))
+```
+
+**Loaders + pilotage best-detection (§9.3bis).**
+
+```python
+from torch.utils.data import DataLoader
+from detection_eval import (SyntheticDevDataset, AuthenticELADataset,
+                            pilot_subset, evaluate, BestDetectionTracker)
+
+dev_ds  = SyntheticDevDataset("<out>/_aggregated/data", "cache/dev", qualities=(90,))
+dev_ld  = DataLoader(pilot_subset(dev_ds, 400, seed=42), batch_size=48, num_workers=8)
+tracker = BestDetectionTracker("experiments/E0/best_model.pt",
+                               history_path="experiments/E0/auprc_curve.json", patience=15)
+
+for epoch in range(100):
+    train_one_epoch(model, train_loader)
+    res = evaluate(model, dev_ld, error_mode="mae", metrics=("auprc",))
+    tracker.update(epoch, res["pixel_auprc"], model)     # checkpoint = max AUPRC dev
+    if tracker.should_stop:
+        break
+```
+
+**Évaluation finale (§9.4)** — dev complet, seuil calibré sur le dev (max Dice),
+**figé** puis repassé une seule fois au test réel :
+
+```python
+res = evaluate(model, dev_full, error_mode="mae", metrics="full", authentic_loader=auth_ld)
+# {pixel_auprc, aupro, threshold, dice, iou, fpr_authentic, image_auroc, pixel_auroc}
+```
+
+Pièges : ne jamais binariser les scores avant `evaluate` (AUPRC/AUPRO ont besoin des
+scores continus) ; garder le même `seed` pour le sous-échantillon pilote ; calibrer le
+seuil sur le dev, jamais sur le test.

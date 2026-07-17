@@ -192,9 +192,13 @@ def _place_dest(rng, img_h, img_w, h, w, alignment,
     - misaligned : au moins un axe non multiple de 8 (cas facile).
     - N/A        : position quelconque (substitution : pas de grille antérieure).
 
-    `forbid` = bbox source [x,y,w,h] à éviter (pour le copy-move, ne pas coller
-    sur soi-même).
+    `forbid` = liste de bbox [x,y,w,h] à ne PAS chevaucher : région source d'un
+    copy-move (ne pas coller sur soi-même) ET zones déjà falsifiées du document
+    (multi-falsification -> empreintes disjointes). Après `max_tries` échecs, on
+    accepte le dernier tirage (dégradation gracieuse, jamais de blocage).
     """
+    forbid = forbid or []
+    y = x = 0
     for _ in range(max_tries):
         if alignment == "aligned":
             y = _snap8(int(rng.integers(0, max(1, img_h - h))))
@@ -212,12 +216,13 @@ def _place_dest(rng, img_h, img_w, h, w, alignment,
             y = int(rng.integers(0, max(1, img_h - h)))
             x = int(rng.integers(0, max(1, img_w - w)))
 
-        if forbid is None:
-            return y, x
-        fx, fy, fw, fh = forbid
-        # Rejet si chevauchement avec la région source.
-        overlap = not (x + w <= fx or fx + fw <= x or y + h <= fy or fy + fh <= y)
-        if not overlap:
+        # Rejet si chevauchement avec l'une des zones interdites.
+        clash = False
+        for fx, fy, fw, fh in forbid:
+            if not (x + w <= fx or fx + fw <= x or y + h <= fy or fy + fh <= y):
+                clash = True
+                break
+        if not clash:
             return y, x
     return y, x  # dernier tirage même si imparfait
 
@@ -230,11 +235,11 @@ def _hard_mask(img_h, img_w, y, x, h, w) -> np.ndarray:
 
 # ---------------------------------------------------------------- éditions
 def _forge_substitution(rng, img, size_class, area_range, feather,
-                        min_w_px: int, min_h_px: int) -> ForgeResult:
+                        min_w_px: int, min_h_px: int, forbid=None) -> ForgeResult:
     """Peint des pixels neufs (texte) : aucune grille 8x8 Q0 antérieure."""
     H, W = img.shape[:2]
     h, w, frac = _sample_size(rng, H, W, area_range, min_w_px, min_h_px)
-    y, x = _place_dest(rng, H, W, h, w, "N/A")
+    y, x = _place_dest(rng, H, W, h, w, "N/A", forbid=forbid)
 
     region = img[y:y + h, x:x + w]
     # Fond échantillonné localement (médiane) -> cohérence photométrique.
@@ -273,7 +278,7 @@ def _forge_substitution(rng, img, size_class, area_range, feather,
 
 
 def _forge_copy_move(rng, img, size_class, area_range, alignment, feather,
-                     min_w_px: int, min_h_px: int) -> ForgeResult:
+                     min_w_px: int, min_h_px: int, forbid=None) -> ForgeResult:
     """Recopie une région de la MÊME image (porte la grille Q0)."""
     H, W = img.shape[:2]
     h, w, frac = _sample_size(rng, H, W, area_range, min_w_px, min_h_px)
@@ -284,7 +289,9 @@ def _forge_copy_move(rng, img, size_class, area_range, alignment, feather,
     sx = max(0, min(sx, ((W - w) // JPEG_BLOCK) * JPEG_BLOCK))
     patch = img[sy:sy + h, sx:sx + w].copy()
 
-    y, x = _place_dest(rng, H, W, h, w, alignment, forbid=[sx, sy, w, h])
+    # Éviter la région source ET les zones déjà falsifiées.
+    y, x = _place_dest(rng, H, W, h, w, alignment,
+                       forbid=[[sx, sy, w, h], *(forbid or [])])
     edited = _composite(img, patch, y, x, h, w, feather)
     mask = _hard_mask(H, W, y, x, h, w)
     return ForgeResult(
@@ -295,7 +302,7 @@ def _forge_copy_move(rng, img, size_class, area_range, alignment, feather,
 
 
 def _forge_splice(rng, img, donor, donor_id, size_class, area_range,
-                  alignment, feather, min_w_px: int, min_h_px: int) -> ForgeResult:
+                  alignment, feather, min_w_px: int, min_h_px: int, forbid=None) -> ForgeResult:
     """Insère une région d'un AUTRE document (porte la grille Q0' du donneur)."""
     H, W = img.shape[:2]
     Hd, Wd = donor.shape[:2]
@@ -313,7 +320,7 @@ def _forge_splice(rng, img, donor, donor_id, size_class, area_range,
     sx = max(0, min(sx, ((Wd - w) // JPEG_BLOCK) * JPEG_BLOCK))
     patch = donor[sy:sy + h, sx:sx + w].copy()
 
-    y, x = _place_dest(rng, H, W, h, w, alignment)
+    y, x = _place_dest(rng, H, W, h, w, alignment, forbid=forbid)
     edited = _composite(img, patch, y, x, h, w, feather)
     mask = _hard_mask(H, W, y, x, h, w)
     return ForgeResult(
@@ -336,8 +343,9 @@ def forge(
     donor: Optional[np.ndarray] = None,
     donor_id: Optional[str] = None,
     min_region_px: Union[int, tuple, list] = JPEG_BLOCK,
+    forbid: Optional[list] = None,
 ) -> ForgeResult:
-    """Point d'entrée : applique une falsification et renvoie image+masque+méta.
+    """Point d'entrée : applique UNE falsification et renvoie image+masque+méta.
 
     `alignment` est ignoré pour la substitution (forcé "N/A"). `donor` est requis
     pour le splice. `min_region_px` = taille MINIMALE garantie du rectangle
@@ -345,20 +353,23 @@ def forge(
     arrondi au multiple de 8 SUPÉRIEUR (grille JPEG). Si l'image source est trop
     petite pour l'accueillir, une erreur explicite est levée (le job est alors
     journalisé en erreur par l'orchestrator, jamais écrit en positif à masque
-    vide).
+    vide). `forbid` = liste de bbox [x,y,w,h] déjà falsifiées à ne pas chevaucher
+    (multi-falsification : appeler `forge` k fois en accumulant les bbox rendues).
     """
     feather = float(rng.uniform(feather_range[0], feather_range[1]))
     min_w_px, min_h_px = normalize_min_region(min_region_px)
 
     if edit_type == "substitution":
-        result = _forge_substitution(rng, img, size_class, area_range, feather, min_w_px, min_h_px)
+        result = _forge_substitution(rng, img, size_class, area_range, feather,
+                                     min_w_px, min_h_px, forbid)
     elif edit_type == "copy_move":
-        result = _forge_copy_move(rng, img, size_class, area_range, alignment, feather, min_w_px, min_h_px)
+        result = _forge_copy_move(rng, img, size_class, area_range, alignment, feather,
+                                  min_w_px, min_h_px, forbid)
     elif edit_type == "splice":
         if donor is None:
             raise ValueError("splice requiert une image donneuse (donor).")
         result = _forge_splice(rng, img, donor, donor_id, size_class, area_range,
-                               alignment, feather, min_w_px, min_h_px)
+                               alignment, feather, min_w_px, min_h_px, forbid)
     else:
         raise ValueError(f"type d'édition inconnu : {edit_type}")
 
