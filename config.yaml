@@ -52,7 +52,7 @@ forger:
   # tirage aléatoire entre types. Ajoute/retire des entrées librement.
   #   sortie -> <output_dir>/<type>/{data,manifest.parquet,distribution.json,
   #             run_config.yaml,REPORT.md}   (chaque sous-dossier est autonome)
-  #   fusion -> python -m src.aggregate --out <output_dir>
+  #   fusion -> ./aggregate.sh --out <output_dir>
   edit_types:
     - substitution            # pixels neufs peints (texte) ; alignment = N/A
     - copy_move               # région recopiée de la même image (grille Q1)
@@ -60,6 +60,15 @@ forger:
   aligned_ratio: 0.5          # part alignée sur la grille 8x8 (copy_move + splice)
   feather_radius_px: [0.5, 2.0]   # adoucissement des bords (anti-tell), tiré uniformément
   splice_source: "intra_corpus"   # donneur = autre doc du même corpus
+  # Taille MINIMALE garantie du rectangle falsifié, quel que soit size_class ou
+  # la taille de l'image : [largeur_min_px, hauteur_min_px] (ou un seul entier
+  # pour un plancher carré). Arrondie au multiple de 8 SUPÉRIEUR (grille JPEG) :
+  # [10, 10] garantit donc >= 16x16, jamais moins que ce qui est demandé ici.
+  # Empêche tout masque à 0 pixel sur des corpus à images très petites
+  # (miniatures, crops) : si une source ne peut pas accueillir ce minimum sur
+  # un axe, le job échoue proprement (erreur journalisée, pas de masque vide
+  # écrit).
+  min_region_px: [10, 10]
 
 # --- Classes de taille de zone (fraction de surface page, calées ×8 px) ------
 size_classes:

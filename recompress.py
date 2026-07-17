@@ -30,7 +30,7 @@ from typing import Optional
 import numpy as np
 from PIL import Image
 
-from .jpeg_probe import estimate_quality, _read_subsampling
+from jpeg_probe import estimate_quality, _read_subsampling
 
 
 # Sous-échantillonnage chroma utilisé pour la passe Q2 finale.

@@ -45,10 +45,10 @@ import yaml
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from . import jpeg_probe
-from .recompress import decode_source, save_q2, recompress_to_q1, DEFAULT_Q2_SUBSAMPLING
-from . import forger as forger_mod
-from . import annotator as ann
+import jpeg_probe
+from recompress import decode_source, save_q2, recompress_to_q1, DEFAULT_Q2_SUBSAMPLING
+import forger as forger_mod
+import annotator as ann
 
 
 _SUBSAMPLING_INT2STR = {0: "4:4:4", 1: "4:2:2", 2: "4:2:0"}
@@ -204,11 +204,14 @@ def _run_job(job: Job, cfg: dict, out_dirs: dict, nonstd_thr: float) -> dict:
                 donor_q = int(rng.choice(q1_sweep))
                 donor_rgb = recompress_to_q1(donor_rgb, donor_q, subsampling=DEFAULT_Q2_SUBSAMPLING)
             # (donneur JPEG : historique natif Q0 conservé, déjà étranger au fond.)
+        # int (carré) ou [largeur_min, hauteur_min] ; normalisé dans forger.forge().
+        min_region_px = cfg["forger"].get("min_region_px", forger_mod.JPEG_BLOCK)
         forge_res = forger_mod.forge(
             img=base_rgb, edit_type=job.edit_type, size_class=job.size_class,
             area_range=area_range, alignment=job.alignment,
             feather_range=feather_range, rng=rng,
             donor=donor_rgb, donor_id=donor_id,
+            min_region_px=min_region_px,
         )
         if donor_q is not None:
             forge_res.extra["donor_q"] = donor_q   # qualité JPEG étrangère du splice
@@ -337,7 +340,7 @@ def _write_batch(sub_root: str, sub_cfg: dict, report: dict, rows: list) -> tupl
         pq.write_table(pa.Table.from_pylist(rows), manifest_path)
     report_path = None
     try:
-        from . import reporter
+        import reporter
         report_path = reporter.write_report(sub_root)
     except Exception as exc:
         print(f"      (rapport non généré : {type(exc).__name__}: {exc})")
@@ -417,7 +420,7 @@ def run(cfg: dict, limit: Optional[int] = None, workers: Optional[int] = None) -
 
     print(f"[4/4] {len(edit_types)} sous-dossier(s) sous {out_root}/ : "
           f"{', '.join(edit_types)}")
-    print(f"      Agréger : python -m src.aggregate --out {out_root}")
+    print(f"      Agréger : ./aggregate.sh --out {out_root}")
     return {"output_dir": out_root, "edit_types": edit_types,
             "distribution": os.path.join(out_root, "distribution.json"),
             "batches": results}

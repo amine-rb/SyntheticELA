@@ -26,7 +26,7 @@ import cv2
 from PIL import Image
 import pyarrow.parquet as pq
 
-from .orchestrator import load_config
+from orchestrator import load_config
 
 
 def compute_ela(rgb: np.ndarray, quality: int = 90) -> np.ndarray:

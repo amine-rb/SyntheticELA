@@ -28,7 +28,7 @@ Dépendances : Pillow + NumPy uniquement.
 
 Usage
 -----
-    python -m src.jpeg_probe --src /chemin/vers/jpeg_kaggle --out output/distribution.json
+    python jpeg_probe.py --src /chemin/vers/jpeg_kaggle --out output/distribution.json
 """
 
 from __future__ import annotations

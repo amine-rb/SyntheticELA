@@ -27,6 +27,16 @@ Anti-"tell" du générateur
 - Substitution : couleur de fond échantillonnée localement, couleur du texte
   dérivée des pixels sombres locaux (cohérence photométrique), police cohérente.
 
+Taille minimale garantie (min_region_px)
+-----------------------------------------
+Chaque rectangle falsifié respecte un plancher [largeur_min, hauteur_min] en
+pixels (config `forger.min_region_px`), quel que soit `size_class` ou la taille
+de l'image. Le plancher est arrondi AU MULTIPLE DE 8 SUPÉRIEUR (grille JPEG) :
+demander 10 garantit >= 16, jamais moins. Si une image source ne peut pas
+accueillir ce minimum sur un axe, une erreur explicite est levée (le job est
+alors journalisé en erreur par l'orchestrator, JAMAIS écrit en positif à masque
+vide).
+
 IMPORTANT : le forger ne compresse RIEN. La passe Q2 unique est faite ensuite par
 `recompress.save_q2` sur l'image composite entière.
 
@@ -37,7 +47,7 @@ from __future__ import annotations
 
 import string
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Union
 
 import cv2
 import numpy as np
@@ -72,25 +82,78 @@ class ForgeResult:
 
 # --------------------------------------------------------------- helpers géom.
 def _snap8(v: int) -> int:
-    """Arrondit au multiple de 8 le plus proche (>= 8)."""
+    """Arrondit au multiple de 8 le plus proche (>= 8). Pour le TIRAGE de taille."""
     return max(JPEG_BLOCK, int(round(v / JPEG_BLOCK)) * JPEG_BLOCK)
 
 
-def _sample_size(rng, img_h, img_w, area_range) -> tuple[int, int, float]:
-    """Tire (h, w) mult. de 8 pour une fraction d'aire dans area_range."""
+def _ceil8(v: int) -> int:
+    """Arrondit au multiple de 8 SUPÉRIEUR (>= 8). Pour un PLANCHER minimal :
+    ne redescend jamais sous la valeur demandée (10 -> 16, jamais 8)."""
+    return max(JPEG_BLOCK, int(np.ceil(v / JPEG_BLOCK)) * JPEG_BLOCK)
+
+
+def normalize_min_region(min_region_px: Union[int, tuple, list]) -> tuple[int, int]:
+    """Normalise `min_region_px` (entier OU [largeur_min, hauteur_min]) en
+    (min_w_px, min_h_px), tous deux multiples de 8 (arrondi supérieur).
+
+    Un entier scalaire s'applique aux deux axes.
+    """
+    if isinstance(min_region_px, (list, tuple)):
+        min_w, min_h = min_region_px
+    else:
+        min_w = min_h = min_region_px
+    return _ceil8(int(min_w)), _ceil8(int(min_h))
+
+
+def _usable_dim(size: int) -> int:
+    """Plus grand multiple de 8 tenant dans `size` (0 si size < 8)."""
+    return (size // JPEG_BLOCK) * JPEG_BLOCK
+
+
+def _clip_to_min(value: int, min_size_px: int, usable: int) -> int:
+    """Borne `value` (déjà multiple de 8) dans [min_size_px, usable].
+
+    `usable` >= min_size_px est un PRÉREQUIS (vérifié par l'appelant via
+    `_check_min_fits`) : le clip ne peut donc jamais redescendre sous le
+    plancher -> plus aucun rectangle 0px silencieux.
+    """
+    return min(max(value, min_size_px), usable)
+
+
+def _check_min_fits(img_h: int, img_w: int, min_h_px: int, min_w_px: int,
+                    context: str = "") -> tuple[int, int]:
+    """Vérifie que l'image peut accueillir (min_w_px x min_h_px).
+
+    Retourne (usable_h, usable_w). Lève une erreur EXPLICITE sinon (image
+    dégénérée/trop petite) : mieux qu'un masque vide écrit silencieusement.
+    """
+    usable_h, usable_w = _usable_dim(img_h), _usable_dim(img_w)
+    if usable_h < min_h_px or usable_w < min_w_px:
+        raise ValueError(
+            f"image trop petite ({img_w}x{img_h}){' ' + context if context else ''} "
+            f"pour min_region_px=({min_w_px}x{min_h_px}) : aucun rectangle "
+            "non-dégénéré possible (réduis forger.min_region_px, ou filtre "
+            "cette source en amont).")
+    return usable_h, usable_w
+
+
+def _sample_size(rng, img_h, img_w, area_range,
+                 min_w_px: int = JPEG_BLOCK, min_h_px: int = JPEG_BLOCK) -> tuple[int, int, float]:
+    """Tire (h, w) mult. de 8 pour une fraction d'aire dans area_range.
+
+    (min_w_px, min_h_px) est un plancher GARANTI (jamais de rectangle plus
+    petit, jamais de rectangle qui dépasse l'image) : voir `_check_min_fits`.
+    """
+    usable_h, usable_w = _check_min_fits(img_h, img_w, min_h_px, min_w_px)
+
     frac = float(rng.uniform(area_range[0], area_range[1]))
     target_area = frac * img_h * img_w
     # Aspect ratio modéré (les zones de reçu sont souvent oblongues).
     ar = float(rng.uniform(0.3, 3.0))
-    w = int(np.sqrt(target_area * ar))
-    h = int(np.sqrt(target_area / ar)) if ar > 0 else w
-    w = _snap8(min(w, img_w - JPEG_BLOCK))
-    h = _snap8(min(h, img_h - JPEG_BLOCK))
-    # Clamp final pour tenir dans l'image.
-    w = min(w, (img_w // JPEG_BLOCK) * JPEG_BLOCK - JPEG_BLOCK)
-    h = min(h, (img_h // JPEG_BLOCK) * JPEG_BLOCK - JPEG_BLOCK)
-    w = max(w, JPEG_BLOCK)
-    h = max(h, JPEG_BLOCK)
+    w = _snap8(int(np.sqrt(target_area * ar)))
+    h = _snap8(int(np.sqrt(target_area / ar)))
+    w = _clip_to_min(w, min_w_px, usable_w)
+    h = _clip_to_min(h, min_h_px, usable_h)
     real_frac = (h * w) / (img_h * img_w)
     return h, w, real_frac
 
@@ -166,10 +229,11 @@ def _hard_mask(img_h, img_w, y, x, h, w) -> np.ndarray:
 
 
 # ---------------------------------------------------------------- éditions
-def _forge_substitution(rng, img, size_class, area_range, feather) -> ForgeResult:
+def _forge_substitution(rng, img, size_class, area_range, feather,
+                        min_w_px: int, min_h_px: int) -> ForgeResult:
     """Peint des pixels neufs (texte) : aucune grille 8x8 Q0 antérieure."""
     H, W = img.shape[:2]
-    h, w, frac = _sample_size(rng, H, W, area_range)
+    h, w, frac = _sample_size(rng, H, W, area_range, min_w_px, min_h_px)
     y, x = _place_dest(rng, H, W, h, w, "N/A")
 
     region = img[y:y + h, x:x + w]
@@ -208,10 +272,11 @@ def _forge_substitution(rng, img, size_class, area_range, feather) -> ForgeResul
     )
 
 
-def _forge_copy_move(rng, img, size_class, area_range, alignment, feather) -> ForgeResult:
+def _forge_copy_move(rng, img, size_class, area_range, alignment, feather,
+                     min_w_px: int, min_h_px: int) -> ForgeResult:
     """Recopie une région de la MÊME image (porte la grille Q0)."""
     H, W = img.shape[:2]
-    h, w, frac = _sample_size(rng, H, W, area_range)
+    h, w, frac = _sample_size(rng, H, W, area_range, min_w_px, min_h_px)
     # Source snappée sur la grille 8 -> on copie des blocs Q0 entiers, phase propre.
     sy = _snap8(int(rng.integers(0, max(1, H - h))))
     sx = _snap8(int(rng.integers(0, max(1, W - w))))
@@ -230,15 +295,17 @@ def _forge_copy_move(rng, img, size_class, area_range, alignment, feather) -> Fo
 
 
 def _forge_splice(rng, img, donor, donor_id, size_class, area_range,
-                  alignment, feather) -> ForgeResult:
+                  alignment, feather, min_w_px: int, min_h_px: int) -> ForgeResult:
     """Insère une région d'un AUTRE document (porte la grille Q0' du donneur)."""
     H, W = img.shape[:2]
     Hd, Wd = donor.shape[:2]
-    # Taille limitée par la plus petite des deux images.
-    h, w, frac = _sample_size(rng, min(H, Hd), min(W, Wd), area_range)
-    h = min(h, (Hd // JPEG_BLOCK) * JPEG_BLOCK - JPEG_BLOCK)
-    w = min(w, (Wd // JPEG_BLOCK) * JPEG_BLOCK - JPEG_BLOCK)
-    h, w = max(JPEG_BLOCK, h), max(JPEG_BLOCK, w)
+    # Taille limitée par la plus petite des deux images (dest ET donneur).
+    h, w, frac = _sample_size(rng, min(H, Hd), min(W, Wd), area_range, min_w_px, min_h_px)
+    # Reclip strict contre le donneur seul (peut être plus petit que dest) :
+    # même garantie que _sample_size, jamais de rectangle 0px silencieux.
+    usable_hd, usable_wd = _check_min_fits(Hd, Wd, min_h_px, min_w_px, context="(donneur)")
+    h = _clip_to_min(h, min_h_px, usable_hd)
+    w = _clip_to_min(w, min_w_px, usable_wd)
 
     sy = _snap8(int(rng.integers(0, max(1, Hd - h))))
     sx = _snap8(int(rng.integers(0, max(1, Wd - w))))
@@ -268,21 +335,37 @@ def forge(
     rng: np.random.Generator,
     donor: Optional[np.ndarray] = None,
     donor_id: Optional[str] = None,
+    min_region_px: Union[int, tuple, list] = JPEG_BLOCK,
 ) -> ForgeResult:
     """Point d'entrée : applique une falsification et renvoie image+masque+méta.
 
     `alignment` est ignoré pour la substitution (forcé "N/A"). `donor` est requis
-    pour le splice.
+    pour le splice. `min_region_px` = taille MINIMALE garantie du rectangle
+    falsifié : un entier (carré) ou `[largeur_min, hauteur_min]` en pixels,
+    arrondi au multiple de 8 SUPÉRIEUR (grille JPEG). Si l'image source est trop
+    petite pour l'accueillir, une erreur explicite est levée (le job est alors
+    journalisé en erreur par l'orchestrator, jamais écrit en positif à masque
+    vide).
     """
     feather = float(rng.uniform(feather_range[0], feather_range[1]))
+    min_w_px, min_h_px = normalize_min_region(min_region_px)
 
     if edit_type == "substitution":
-        return _forge_substitution(rng, img, size_class, area_range, feather)
-    if edit_type == "copy_move":
-        return _forge_copy_move(rng, img, size_class, area_range, alignment, feather)
-    if edit_type == "splice":
+        result = _forge_substitution(rng, img, size_class, area_range, feather, min_w_px, min_h_px)
+    elif edit_type == "copy_move":
+        result = _forge_copy_move(rng, img, size_class, area_range, alignment, feather, min_w_px, min_h_px)
+    elif edit_type == "splice":
         if donor is None:
             raise ValueError("splice requiert une image donneuse (donor).")
-        return _forge_splice(rng, img, donor, donor_id, size_class, area_range,
-                             alignment, feather)
-    raise ValueError(f"type d'édition inconnu : {edit_type}")
+        result = _forge_splice(rng, img, donor, donor_id, size_class, area_range,
+                               alignment, feather, min_w_px, min_h_px)
+    else:
+        raise ValueError(f"type d'édition inconnu : {edit_type}")
+
+    # Filet de sécurité : un positif ne doit JAMAIS sortir avec un masque vide.
+    if not result.mask.any():
+        raise RuntimeError(
+            f"masque vide produit pour edit_type={edit_type} (bbox={result.bbox}) "
+            "malgré le plancher min_region_px : signaler ce cas, il ne devrait "
+            "plus être possible.")
+    return result

@@ -16,8 +16,8 @@ lot existant.
 
 Usage
 -----
-    python -m src.reporter --out output              # rapport seul
-    python -m src.reporter --out output --ela-sample 0   # sans mesure ELA
+    python reporter.py --out output              # rapport seul
+    python reporter.py --out output --ela-sample 0   # sans mesure ELA
 """
 
 from __future__ import annotations
@@ -115,7 +115,7 @@ def write_report(out_root: str, ela_quality: int = 90, ela_sample: int = 60) -> 
 
     L = []
     L.append(f"# Rapport de génération — `{out_root}`\n")
-    L.append(f"> Auto-généré par `src.reporter`. {n} documents.\n")
+    L.append(f"> Auto-généré par `reporter.py`. {n} documents.\n")
 
     # --- 1. Source & config ---
     L.append("## 1. Source & configuration\n")

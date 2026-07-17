@@ -20,9 +20,9 @@ dossier agrégé -> aucune réécriture.
 Usage
 -----
     # tous les sous-dossiers présents :
-    python -m src.aggregate --out output
+    python aggregate.py --out output
     # sélection explicite + lien symbolique (pas de copie disque) :
-    python -m src.aggregate --out output --types substitution splice --mode symlink
+    python aggregate.py --out output --types substitution splice --mode symlink
 
 Dépendances : PyArrow, PyYAML.
 """
@@ -74,7 +74,7 @@ def aggregate(out_root: str, types: list[str] | None = None,
     if not types:
         raise RuntimeError(
             f"Aucun sous-dossier de type avec manifeste sous {out_root} "
-            "(lance d'abord `python -m src.orchestrator`).")
+            "(lance d'abord `python orchestrator.py` ou `./run.sh`).")
 
     dest_root = os.path.join(out_root, dest)
     os.makedirs(os.path.join(dest_root, "data"), exist_ok=True)
@@ -124,7 +124,7 @@ def aggregate(out_root: str, types: list[str] | None = None,
 
     # Rapport régénéré sur le lot fusionné.
     try:
-        from . import reporter
+        import reporter
         reporter.write_report(dest_root)
     except Exception as exc:
         print(f"  (rapport non généré : {type(exc).__name__}: {exc})")
