@@ -70,16 +70,48 @@ class Job:
 
 
 # ------------------------------------------------------------------ planning
-def _weighted_choice(rng: np.random.Generator, mapping: dict) -> str:
-    keys = list(mapping.keys())
-    probs = np.array([mapping[k] for k in keys], dtype=np.float64)
-    probs = probs / probs.sum()
-    return keys[int(rng.choice(len(keys), p=probs))]
+KNOWN_EDIT_TYPES = ("substitution", "copy_move", "splice")
 
 
-def plan_jobs(cfg: dict, source_paths: list[str]) -> list[Job]:
-    """Construit la liste des jobs déterministes à partir de la config."""
-    master = np.random.default_rng(cfg["orchestrator"]["seed"])
+def resolve_edit_types(cfg: dict) -> list[str]:
+    """Liste ordonnée et dédupliquée des types à générer (un sous-dossier chacun).
+
+    Source : `forger.edit_types`. Rétro-compat : si absent, dérive de l'ancien
+    `forger.edit_type_ratios` (types à poids > 0). Il n'y a PLUS aucun tirage
+    aléatoire entre types : chaque type est un lot complet et séparé.
+    """
+    fc = cfg.get("forger", {})
+    types = fc.get("edit_types")
+    if not types:
+        ratios = fc.get("edit_type_ratios", {}) or {}
+        types = [t for t, w in ratios.items() if w and float(w) > 0]
+    if not types:
+        raise ValueError(
+            "forger.edit_types est vide : liste au moins un type parmi "
+            f"{list(KNOWN_EDIT_TYPES)}.")
+    unknown = [t for t in types if t not in KNOWN_EDIT_TYPES]
+    if unknown:
+        raise ValueError(
+            f"forger.edit_types contient des types inconnus {unknown} ; "
+            f"connus : {list(KNOWN_EDIT_TYPES)}.")
+    seen, ordered = set(), []
+    for t in types:
+        if t not in seen:
+            seen.add(t)
+            ordered.append(t)
+    return ordered
+
+
+def plan_jobs(cfg: dict, source_paths: list[str], edit_type: str,
+              doc_prefix: str, type_index: int = 0) -> list[Job]:
+    """Jobs déterministes pour UN SEUL type d'édition (un sous-dossier).
+
+    Chaque type reçoit un flux aléatoire décorrélé (seed `[seed, type_index]`) :
+    négatifs et sources tirés diffèrent d'un type à l'autre -> aucun doublon exact
+    entre sous-dossiers lors de l'agrégation. Les doc_id sont préfixés par
+    `doc_prefix` -> uniques globalement -> agrégation sans collision.
+    """
+    master = np.random.default_rng([int(cfg["orchestrator"]["seed"]), int(type_index)])
     n_docs = int(cfg["orchestrator"]["n_docs"])
     q2_sweep = cfg["compression"]["q2_sweep"]
     # Mode Q1 : "native" (Q0 lu, scénario réaliste, défaut) ou "controlled"
@@ -87,7 +119,6 @@ def plan_jobs(cfg: dict, source_paths: list[str]) -> list[Job]:
     q1_mode = cfg["compression"].get("q1_mode", "native")
     q1_sweep = cfg["compression"].get("q1_sweep", [])
     neg_ratio = float(cfg["negatives"]["ratio"])
-    type_ratios = cfg["forger"]["edit_type_ratios"]
     aligned_ratio = float(cfg["forger"]["aligned_ratio"])
     size_classes = list(cfg["size_classes"].keys())
 
@@ -104,16 +135,16 @@ def plan_jobs(cfg: dict, source_paths: list[str]) -> list[Job]:
             q1 = int(q1_sweep[(i // len(q2_sweep)) % len(q1_sweep)])
         source_path = str(master.choice(source_paths))
         is_negative = bool(master.random() < neg_ratio)
+        doc_id = f"{doc_prefix}_{i:06d}"
 
         if is_negative:
             jobs.append(Job(
-                doc_id=f"doc_{i:06d}", seed=seed, q2=q2, is_negative=True,
+                doc_id=doc_id, seed=seed, q2=q2, is_negative=True,
                 source_path=source_path, edit_type=None, size_class=None,
                 alignment=None, donor_path=None, q1=q1,
             ))
             continue
 
-        edit_type = _weighted_choice(jrng, type_ratios)
         size_class = str(size_classes[int(jrng.integers(0, len(size_classes)))])
 
         if edit_type == "substitution":
@@ -128,7 +159,7 @@ def plan_jobs(cfg: dict, source_paths: list[str]) -> list[Job]:
                 donor_path = str(master.choice(others))
 
         jobs.append(Job(
-            doc_id=f"doc_{i:06d}", seed=seed, q2=q2, is_negative=False,
+            doc_id=doc_id, seed=seed, q2=q2, is_negative=False,
             source_path=source_path, edit_type=edit_type, size_class=size_class,
             alignment=alignment, donor_path=donor_path, q1=q1,
         ))
@@ -279,19 +310,52 @@ def _resolve_q1_mode(cfg: dict, report: dict) -> tuple[str, str]:
 
 
 # ------------------------------------------------------------------ driver
+def _execute_jobs(jobs: list[Job], cfg: dict, out_dirs: dict,
+                  nonstd_thr: float, n_workers: int) -> tuple[list, list]:
+    """Exécute une liste de jobs (séquentiel ou parallèle) -> (rows, errors)."""
+    rows, errors = [], []
+    payloads = [(j, cfg, out_dirs, nonstd_thr) for j in jobs]
+    if n_workers <= 1:
+        for p in payloads:
+            r = _worker(p)
+            (errors if "error" in r else rows).append(r)
+    else:
+        with ProcessPoolExecutor(max_workers=n_workers) as ex:
+            for r in ex.map(_worker, payloads, chunksize=4):
+                (errors if "error" in r else rows).append(r)
+    return rows, errors
+
+
+def _write_batch(sub_root: str, sub_cfg: dict, report: dict, rows: list) -> tuple:
+    """Rend un sous-dossier AUTONOME : distribution + config + manifeste + rapport."""
+    with open(os.path.join(sub_root, "distribution.json"), "w") as f:
+        json.dump(report, f, indent=2)
+    with open(os.path.join(sub_root, "run_config.yaml"), "w") as f:
+        yaml.safe_dump(sub_cfg, f, sort_keys=False, allow_unicode=True)
+    manifest_path = os.path.join(sub_root, "manifest.parquet")
+    if rows:
+        pq.write_table(pa.Table.from_pylist(rows), manifest_path)
+    report_path = None
+    try:
+        from . import reporter
+        report_path = reporter.write_report(sub_root)
+    except Exception as exc:
+        print(f"      (rapport non généré : {type(exc).__name__}: {exc})")
+    return manifest_path, report_path
+
+
 def run(cfg: dict, limit: Optional[int] = None, workers: Optional[int] = None) -> dict:
     src_dir = cfg["paths"]["source_dir"]
     if not src_dir:
         raise ValueError("paths.source_dir est vide : renseigne le dossier des JPEG sources.")
     out_root = cfg["paths"]["output_dir"]
-    out_dirs = {"root": out_root, "data": os.path.join(out_root, "data")}
-    os.makedirs(out_dirs["data"], exist_ok=True)
+    os.makedirs(out_root, exist_ok=True)
 
     nonstd_thr = float(cfg["probe"]["nonstandard_absdiff_threshold"])
-    if limit is not None:  # appliqué tôt pour que le snapshot reflète le lot réel
+    if limit is not None:  # n_docs PAR TYPE (chaque sous-dossier aura `limit` docs)
         cfg = {**cfg, "orchestrator": {**cfg["orchestrator"], "n_docs": limit}}
 
-    # 1) Sonde du corpus -> distribution.json + liste des sources valides.
+    # 1) Sonde du corpus UNE SEULE FOIS (partagée par tous les types).
     allow_lossless = bool(cfg["probe"].get("allow_lossless", True))
     print(f"[1/4] probe sur {src_dir} ...")
     report = jpeg_probe.probe_dir(
@@ -308,8 +372,7 @@ def run(cfg: dict, limit: Optional[int] = None, workers: Optional[int] = None) -
     print(f"      {len(source_paths)} sources gardées "
           f"(dont {n_lossless} lossless), {report['summary']['n_excluded']} exclues.")
 
-    # Résolution du mode Q1 (auto -> décidé d'après le corpus). Ancre le choix
-    # dans la config effective AVANT le snapshot, pour la reproductibilité.
+    # Résolution du mode Q1 (auto -> décidé d'après le corpus), figée pour tous les types.
     resolved_mode, reason = _resolve_q1_mode(cfg, report)
     cfg = {**cfg, "compression": {**cfg["compression"], "q1_mode": resolved_mode}}
     print(f"      q1_mode = {resolved_mode}  ({reason})")
@@ -319,57 +382,45 @@ def run(cfg: dict, limit: Optional[int] = None, workers: Optional[int] = None) -
             "En native le fond n'est pas double-compressé -> aucun signal. Utilise "
             "q1_mode: controlled (ou auto).")
 
-    dist_path = os.path.join(out_root, "distribution.json")
-    os.makedirs(out_root, exist_ok=True)
-    with open(dist_path, "w") as f:
+    # Snapshot corpus-level à la racine (référence commune).
+    with open(os.path.join(out_root, "distribution.json"), "w") as f:
         json.dump(report, f, indent=2)
-    # Snapshot de la config effective (reproductibilité du lot).
-    with open(os.path.join(out_root, "run_config.yaml"), "w") as f:
-        yaml.safe_dump(cfg, f, sort_keys=False, allow_unicode=True)
 
-    # 2) Planning déterministe.
-    jobs = plan_jobs(cfg, source_paths)
-    print(f"[2/4] {len(jobs)} jobs planifiés (seed global {cfg['orchestrator']['seed']}).")
-
-    # 3) Exécution.
+    # 2) Un lot COMPLET ET SÉPARÉ par type d'édition -> un sous-dossier chacun.
+    edit_types = resolve_edit_types(cfg)
     n_workers = workers if workers is not None else int(cfg["orchestrator"]["n_workers"])
-    print(f"[3/4] génération sur {n_workers} worker(s) ...")
-    rows, errors = [], []
-    payloads = [(j, cfg, out_dirs, nonstd_thr) for j in jobs]
+    n_per = int(cfg["orchestrator"]["n_docs"])
+    print(f"[2/4] types : {edit_types}  (un sous-dossier chacun, {n_per} docs/type, "
+          f"seed global {cfg['orchestrator']['seed']})")
 
-    if n_workers <= 1:
-        for p in payloads:
-            r = _worker(p)
-            (errors if "error" in r else rows).append(r)
-    else:
-        with ProcessPoolExecutor(max_workers=n_workers) as ex:
-            for r in ex.map(_worker, payloads, chunksize=4):
-                (errors if "error" in r else rows).append(r)
+    results = {}
+    for ti, etype in enumerate(edit_types):
+        sub_root = os.path.join(out_root, etype)
+        sub_dirs = {"root": sub_root, "data": os.path.join(sub_root, "data")}
+        os.makedirs(sub_dirs["data"], exist_ok=True)
+        # Config effective du sous-dossier : self-describing (edit_type scalaire).
+        sub_cfg = {
+            **cfg,
+            "paths": {**cfg["paths"], "output_dir": sub_root},
+            "forger": {**cfg["forger"], "edit_types": [etype], "edit_type": etype},
+        }
+        jobs = plan_jobs(sub_cfg, source_paths, etype, doc_prefix=etype, type_index=ti)
+        print(f"[3/4] [{etype}] {len(jobs)} jobs -> {n_workers} worker(s) ...")
+        rows, errors = _execute_jobs(jobs, sub_cfg, sub_dirs, nonstd_thr, n_workers)
+        print(f"      [{etype}] {len(rows)} écrits, {len(errors)} erreurs.")
+        for e in errors[:5]:
+            print(f"        ERREUR {e['id']}: {e['error']}")
+        manifest_path, report_path = _write_batch(sub_root, sub_cfg, report, rows)
+        _print_batch_summary(rows)
+        results[etype] = {"root": sub_root, "rows": rows, "errors": errors,
+                          "manifest": manifest_path, "report": report_path}
 
-    print(f"      {len(rows)} documents écrits, {len(errors)} erreurs.")
-    for e in errors[:10]:
-        print(f"        ERREUR {e['id']}: {e['error']}")
-
-    # 4) Manifeste global.
-    manifest_path = os.path.join(out_root, "manifest.parquet")
-    if rows:
-        table = pa.Table.from_pylist(rows)
-        pq.write_table(table, manifest_path)
-    print(f"[4/4] manifeste écrit : {manifest_path}")
-
-    _print_batch_summary(rows)
-
-    # Rapport lisible auto-généré (REPORT.md) décrivant les résultats du lot.
-    report_path = None
-    try:
-        from . import reporter
-        report_path = reporter.write_report(out_root)
-        print(f"      rapport écrit : {report_path}")
-    except Exception as exc:
-        print(f"      (rapport non généré : {type(exc).__name__}: {exc})")
-
-    return {"rows": rows, "errors": errors, "manifest": manifest_path,
-            "distribution": dist_path, "report": report_path}
+    print(f"[4/4] {len(edit_types)} sous-dossier(s) sous {out_root}/ : "
+          f"{', '.join(edit_types)}")
+    print(f"      Agréger : python -m src.aggregate --out {out_root}")
+    return {"output_dir": out_root, "edit_types": edit_types,
+            "distribution": os.path.join(out_root, "distribution.json"),
+            "batches": results}
 
 
 def _print_batch_summary(rows: list[dict]) -> None:

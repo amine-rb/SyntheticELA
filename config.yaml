@@ -48,11 +48,15 @@ compression:
 
 # --- Falsification (module forger) -------------------------------------------
 forger:
-  # Ratios des types d'édition (somme = 1.0 sur les POSITIFS).
-  edit_type_ratios:
-    substitution: 0.34        # pixels neufs peints (texte) ; alignment = N/A
-    copy_move: 0.33           # région recopiée de la même image (grille Q1)
-    splice: 0.33              # région d'un autre document du corpus (grille étrangère)
+  # Types à générer : UN SOUS-DOSSIER COMPLET ET SÉPARÉ par type, PLUS aucun
+  # tirage aléatoire entre types. Ajoute/retire des entrées librement.
+  #   sortie -> <output_dir>/<type>/{data,manifest.parquet,distribution.json,
+  #             run_config.yaml,REPORT.md}   (chaque sous-dossier est autonome)
+  #   fusion -> python -m src.aggregate --out <output_dir>
+  edit_types:
+    - substitution            # pixels neufs peints (texte) ; alignment = N/A
+    - copy_move               # région recopiée de la même image (grille Q1)
+    - splice                  # région d'un autre document du corpus (grille étrangère)
   aligned_ratio: 0.5          # part alignée sur la grille 8x8 (copy_move + splice)
   feather_radius_px: [0.5, 2.0]   # adoucissement des bords (anti-tell), tiré uniformément
   splice_source: "intra_corpus"   # donneur = autre doc du même corpus
@@ -65,6 +69,9 @@ size_classes:
   very_large: [0.06, 0.15]    # 6% – 15%
 
 # --- Négatifs ----------------------------------------------------------------
+# `ratio` s'applique DANS CHAQUE sous-dossier de type : chacun contient ses
+# positifs (de son type) + sa part d'authentiques -> sous-dossier autonome, et
+# le ratio est PRÉSERVÉ après agrégation (mêmes proportions dans le lot fusionné).
 negatives:
   ratio: 0.3                  # part de documents authentiques (Q0/Q1 -> Q2, masque vide)
   keep_benign_colored: true   # préserve logos/tampons/en-têtes (évite "coloré = anomalie")
@@ -84,5 +91,5 @@ ela_preview:
 # --- Orchestration (module orchestrator) -------------------------------------
 orchestrator:
   seed: 42                    # seed global ; chaque doc reçoit un seed dérivé déterministe
-  n_docs: 2000                # taille du lot (centaines à quelques milliers)
+  n_docs: 2000                # taille du lot PAR TYPE (chaque sous-dossier aura n_docs docs)
   n_workers: 4                # parallélisation

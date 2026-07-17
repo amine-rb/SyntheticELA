@@ -189,7 +189,7 @@ def write_report(out_root: str, ela_quality: int = 90, ela_sample: int = 60) -> 
         L.append(f"Ratio ELA-Q{ela_quality} moyen **intérieur/extérieur du masque** "
                  f"(échantillon de {n_used} positifs). >1 = la zone ressort ; "
                  "<1 = zone « anormalement propre » (substitution à fond plat).\n")
-        types = ["substitution", "copy_move", "splice"]
+        types = sorted({k[0] for k in agg}) or ["substitution", "copy_move", "splice"]
         regimes = ["Q1<Q2", "Q1=Q2", "Q1>Q2"]
         tbl_rows = []
         for t in types:

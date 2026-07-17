@@ -20,11 +20,16 @@ pip install -r requirements.txt   # Pillow, NumPy, OpenCV, PyYAML, PyArrow
 ## 2. Démarrage rapide (n'importe quel dataset)
 
 ```bash
-# Génération (le pipeline sonde le corpus et choisit tout seul le mode adapté)
+# Génération : UN SOUS-DOSSIER par type d'édition (config forger.edit_types).
+# Le pipeline sonde le corpus et choisit tout seul le mode de compression.
 python -m src.orchestrator --src <DOSSIER_IMAGES> --out <DOSSIER_SORTIE> --n 1000
+#   -> <DOSSIER_SORTIE>/substitution/ , /copy_move/ , /splice/  (chacun autonome)
 
-# Planches de contrôle visuel (image | ELA | masque)
-python -m src.ela_preview  --out <DOSSIER_SORTIE>
+# (option) Fusionner les sous-dossiers en un dataset unique
+python -m src.aggregate    --out <DOSSIER_SORTIE>            # -> <...>/_aggregated/
+
+# Planches de contrôle visuel (image | ELA | masque) sur un sous-dossier donné
+python -m src.ela_preview  --out <DOSSIER_SORTIE>/_aggregated
 ```
 
 Exemples :
@@ -56,18 +61,28 @@ Trois types d'édition :
 - **copy_move** — région recopiée de la même image (porte la grille Q1) ; offset ×8 → aligné, sinon désaligné.
 - **splice** — région d'un autre document du corpus (grille étrangère) ; même contrôle d'alignement.
 
-## 4. Sorties (par run)
+## 4. Sorties (un sous-dossier AUTONOME par type)
+
+Chaque type demandé dans `forger.edit_types` produit un sous-dossier complet et
+indépendant (il ne manque aucune info pour l'entraînement/évaluation en aval) :
 
 ```
-<out>/data/<id>.jpg          # document final (fond Q1->Q2, zone incohérente)
-<out>/data/<id>_mask.png     # masque binaire pixel EXACT (sans dilatation)
-<out>/data/<id>.json         # Q0, Q1, Q2, type, taille, alignement, bbox, seed, grille patch 24x24
-<out>/manifest.parquet       # table globale (une ligne par document)
-<out>/distribution.json      # sonde du corpus source (Q0 / lossless / dimensions)
-<out>/run_config.yaml        # config effective figée (reproductibilité)
-<out>/REPORT.md              # rapport lisible des résultats du run  ← §5
-<out>/ela_preview/           # planches QA (après `python -m src.ela_preview`)
+<out>/distribution.json          # sonde du corpus source (commune à tous les types)
+<out>/<type>/                     # ex. substitution / copy_move / splice
+     data/<type>_<id>.jpg         # document final (fond Q1->Q2, zone incohérente)
+     data/<type>_<id>_mask.png    # masque binaire pixel EXACT (sans dilatation)
+     data/<type>_<id>.json        # Q0, Q1, Q2, type, taille, alignement, bbox, seed, grille 24x24
+     manifest.parquet             # table du sous-dossier (une ligne par document)
+     distribution.json            # sonde du corpus (copie, self-contained)
+     run_config.yaml              # config effective figée (dont edit_type)
+     REPORT.md                    # rapport lisible des résultats  ← §5
+     ela_preview/                 # planches QA (après `python -m src.ela_preview`)
 ```
+
+Les `id` sont **préfixés par le type** → uniques globalement. `python -m src.aggregate`
+réunit les sous-dossiers choisis dans `<out>/_aggregated/` (même structure, manifeste
+concaténé, colonne `type` re-filtrable). Options : `--types t1 t2`, `--dest NOM`,
+`--mode copy|symlink|hardlink` (symlink/hardlink = pas de duplication disque).
 
 Colonnes du manifeste : `id, source_id, q0, q0_nonstandard, q1_mode, q1_effective,
 q2, type, size_class, alignment, is_negative, bbox_x/y/w/h, n_mask_px, mask_frac,
@@ -121,11 +136,11 @@ Tous les défauts sont dans `config.yaml`, commentés. Principaux réglages :
 | `paths` | `source_dir`, `output_dir` | corpus & sortie (surchargés par `--src` / `--out`) |
 | `probe` | `candidate_ext`, `allow_lossless` | extensions acceptées, prise en charge lossless |
 | `compression` | `q2_sweep`, `q1_mode`, `q1_sweep`, `q1_auto_q0_threshold` | balayage de compression |
-| `forger` | `edit_type_ratios`, `aligned_ratio`, `feather_radius_px` | mix des falsifications |
+| `forger` | `edit_types`, `aligned_ratio`, `feather_radius_px` | types générés (1 sous-dossier/type) |
 | `size_classes` | small…very_large | tailles de zone (fraction de page, ×8 px) |
-| `negatives` | `ratio` | part d'authentiques (masque vide) |
+| `negatives` | `ratio` | part d'authentiques (masque vide), **par sous-dossier** |
 | `annotator` | `patch_size`, `patch_grid`, `patch_positive_overlap` | grille patch |
-| `orchestrator` | `seed`, `n_docs`, `n_workers` | lot & parallélisme |
+| `orchestrator` | `seed`, `n_docs`, `n_workers` | lot **par type** & parallélisme |
 
 Surcharges CLI : `--src`, `--out`, `--n`, `--workers`, `--config`.
 
@@ -137,7 +152,8 @@ Surcharges CLI : `--src`, `--out`, `--n`, `--workers`, `--config`.
 | `recompress`  | Décode la source ; `recompress_to_q1` (mode contrôlé) ; `save_q2` (passe Q2 unique). |
 | `forger`      | substitution / copy_move / splice ; feather anti-tell ; cohérence photométrique. |
 | `annotator`   | Masque exact, bbox, grille patch 24×24, métadonnées JSON. |
-| `orchestrator`| Batch scriptable, seeds déterministes, mode Q1 auto, parallélisme, manifeste. |
+| `orchestrator`| Batch scriptable, un sous-dossier autonome par type, seeds déterministes, mode Q1 auto, manifeste. |
+| `aggregate`   | Fusionne les sous-dossiers de types en un dataset unique (`_aggregated/`), copy/symlink/hardlink. |
 | `reporter`    | `REPORT.md` (résultats du run + séparabilité ELA). |
 | `ela_preview` | Planches QA image \| ELA \| masque (ELA à une qualité distincte de Q2). |
 
