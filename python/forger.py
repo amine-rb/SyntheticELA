@@ -57,12 +57,28 @@ import numpy as np
 # Grille DCT JPEG : les blocs font 8x8. L'alignement se joue modulo 8.
 JPEG_BLOCK = 8
 
-# Alphabet pour le texte synthétique de substitution (montants/dates plausibles).
-_TEXT_ALPHABET = string.digits + string.ascii_uppercase + " .,:/-$"
-
 # Polices Hershey d'OpenCV (scalables, aucun fichier externe requis) : on couvre
 # un rendu proche d'une police de reçu.
 _CV_FONTS = [cv2.FONT_HERSHEY_SIMPLEX, cv2.FONT_HERSHEY_DUPLEX, cv2.FONT_HERSHEY_PLAIN]
+
+# Lever 2 — encre : contraste minimal (luminance) fond↔encre pour garantir de
+# VRAIS bords (donc un vrai signal ELA), et luminance cible d'une encre sombre
+# de secours quand la zone n'a pas de pixels naturellement foncés.
+_MIN_INK_CONTRAST = 90.0
+_INK_TARGET_LUM = 55.0
+
+# Réalisme substitution : la hauteur du texte injecté est CALÉE SUR LE TEXTE RÉEL
+# du document (mesuré par composantes connexes, cf. `_estimate_text_height`), et
+# NON sur une fraction devinée -> plus de « gros chiffres » qui trahissent le
+# générateur (un vrai faussaire respecte la taille du corps de texte).
+#   _SUBST_EMPHASIS : facteur vs le texte du document (1.0 = identique ; léger
+#     renforcement possible, comme un montant total mis en avant).
+#   _LINE_H_FRAC : REPLI seulement, si la page a trop peu de texte pour une mesure
+#     fiable (calé ~0.6–1.1% de page, ordre de grandeur d'un corps de facture).
+#   _SIZE_NCHARS : longueur de la valeur plausible selon la classe de taille.
+_LINE_H_FRAC = (0.006, 0.011)
+_SUBST_EMPHASIS = (0.9, 1.3)
+_SIZE_NCHARS = {"small": (2, 6), "medium": (4, 9), "large": (6, 13), "very_large": (9, 18)}
 
 
 @dataclass
@@ -182,8 +198,77 @@ def _composite(base, patch, y, x, h, w, radius) -> np.ndarray:
     return out
 
 
-def _place_dest(rng, img_h, img_w, h, w, alignment,
-                forbid=None, max_tries=60) -> tuple[int, int]:
+def _content_mask(img: np.ndarray) -> np.ndarray:
+    """Masque booléen (H, W) des pixels 'encre' (contenu sombre) via Otsu.
+
+    Lever 1 : sert à placer les falsifications SUR du contenu réel (texte,
+    chiffres) plutôt que dans les marges blanches -> zone réaliste et porteuse de
+    signal ELA. Sur une page quasi vide, le masque est presque vide et le
+    placement retombe gracieusement sur le meilleur candidat (cf. `_place_dest`).
+    """
+    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+    # Otsu -> seuil bimodal texte/fond ; INV => True là où c'est sombre (encre).
+    _, binv = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
+    return binv > 0
+
+
+def _content_frac(content, y, x, h, w) -> float:
+    """Fraction de pixels 'encre' dans le rectangle (y,x,h,w)."""
+    return float(content[y:y + h, x:x + w].mean()) if content is not None else 0.0
+
+
+def _estimate_text_height(img: np.ndarray, content: Optional[np.ndarray] = None) -> Optional[float]:
+    """Hauteur médiane des glyphes du DOCUMENT (px), via composantes connexes du
+    masque d'encre.
+
+    Sert à caler la substitution sur la taille du texte RÉEL (anti-tell : plus de
+    texte géant). On ne garde que des blobs « glyphe » : hauteur dans une bande
+    relative à la page (exclut le bruit/points en bas, logos et gros titres en
+    haut) et largeur bornée (exclut filets et lignes pleine largeur). Renvoie None
+    si trop peu de texte fiable -> l'appelant retombe sur une fraction de page.
+    """
+    H, W = img.shape[:2]
+    ink = content if content is not None else _content_mask(img)
+    ink_u8 = (ink.astype(np.uint8) * 255)
+    n, _, stats, _ = cv2.connectedComponentsWithStats(ink_u8, connectivity=8)
+    h_lo = max(3, int(round(0.0015 * H)))         # exclut bruit / points / accents
+    h_hi = max(h_lo + 1, int(round(0.05 * H)))    # exclut logos / gros titres
+    w_hi = max(1, int(round(0.35 * W)))           # exclut filets / lignes pleine largeur
+    heights = []
+    for i in range(1, n):
+        bw = stats[i, cv2.CC_STAT_WIDTH]
+        bh = stats[i, cv2.CC_STAT_HEIGHT]
+        ba = stats[i, cv2.CC_STAT_AREA]
+        if h_lo <= bh <= h_hi and bw <= w_hi and ba >= 6:
+            heights.append(bh)
+    if len(heights) < 10:                          # page quasi vide / atypique
+        return None
+    return float(np.median(heights))
+
+
+def _pick_source(rng, img_h, img_w, h, w, content=None,
+                 min_content_frac=0.0, max_tries=40) -> tuple[int, int]:
+    """Position SOURCE (snappée grille 8) pour copy_move/splice, préférant le
+    contenu si `content` fourni. Dégradation gracieuse : meilleur candidat vu."""
+    max_sy = ((img_h - h) // JPEG_BLOCK) * JPEG_BLOCK
+    max_sx = ((img_w - w) // JPEG_BLOCK) * JPEG_BLOCK
+    last, best = (0, 0), None
+    for _ in range(max_tries):
+        sy = max(0, min(_snap8(int(rng.integers(0, max(1, img_h - h)))), max_sy))
+        sx = max(0, min(_snap8(int(rng.integers(0, max(1, img_w - w)))), max_sx))
+        last = (sy, sx)
+        if content is None or min_content_frac <= 0.0:
+            return sy, sx
+        frac = _content_frac(content, sy, sx, h, w)
+        if frac >= min_content_frac:
+            return sy, sx
+        if best is None or frac > best[0]:
+            best = (frac, sy, sx)
+    return (best[1], best[2]) if best else last
+
+
+def _place_dest(rng, img_h, img_w, h, w, alignment, forbid=None,
+                content=None, min_content_frac=0.0, max_tries=60) -> tuple[int, int]:
     """Choisit la position de destination (y, x) selon l'alignement demandé.
 
     - aligned    : (y, x) multiples de 8  -> le décalage source->dest est mult. 8,
@@ -192,13 +277,15 @@ def _place_dest(rng, img_h, img_w, h, w, alignment,
     - misaligned : au moins un axe non multiple de 8 (cas facile).
     - N/A        : position quelconque (substitution : pas de grille antérieure).
 
-    `forbid` = liste de bbox [x,y,w,h] à ne PAS chevaucher : région source d'un
-    copy-move (ne pas coller sur soi-même) ET zones déjà falsifiées du document
-    (multi-falsification -> empreintes disjointes). Après `max_tries` échecs, on
-    accepte le dernier tirage (dégradation gracieuse, jamais de blocage).
+    `forbid` = liste de bbox [x,y,w,h] à ne PAS chevaucher (contrainte DURE) :
+    région source d'un copy-move ET zones déjà falsifiées (multi-falsification).
+    `content` + `min_content_frac` (Lever 1) = préfère les positions couvrant du
+    contenu réel (contrainte SOUPLE, best-effort). Après `max_tries` échecs, on
+    renvoie le meilleur candidat respectant `forbid` (ou le dernier tiré) :
+    dégradation gracieuse, jamais de blocage ni de masque vide.
     """
     forbid = forbid or []
-    y = x = 0
+    last, best = (0, 0), None
     for _ in range(max_tries):
         if alignment == "aligned":
             y = _snap8(int(rng.integers(0, max(1, img_h - h))))
@@ -216,15 +303,26 @@ def _place_dest(rng, img_h, img_w, h, w, alignment,
             y = int(rng.integers(0, max(1, img_h - h)))
             x = int(rng.integers(0, max(1, img_w - w)))
 
-        # Rejet si chevauchement avec l'une des zones interdites.
+        last = (y, x)
+        # Contrainte DURE : pas de chevauchement avec une zone interdite.
         clash = False
         for fx, fy, fw, fh in forbid:
             if not (x + w <= fx or fx + fw <= x or y + h <= fy or fy + fh <= y):
                 clash = True
                 break
-        if not clash:
+        if clash:
+            continue
+        # Contrainte SOUPLE : préférer le contenu.
+        if content is None or min_content_frac <= 0.0:
             return y, x
-    return y, x  # dernier tirage même si imparfait
+        frac = _content_frac(content, y, x, h, w)
+        if frac >= min_content_frac:
+            return y, x
+        if best is None or frac > best[0]:
+            best = (frac, y, x)
+    if best is not None:
+        return best[1], best[2]
+    return last  # aucun candidat sans chevauchement : dernier tirage
 
 
 def _hard_mask(img_h, img_w, y, x, h, w) -> np.ndarray:
@@ -234,64 +332,125 @@ def _hard_mask(img_h, img_w, y, x, h, w) -> np.ndarray:
 
 
 # ---------------------------------------------------------------- éditions
+def _plausible_token(rng, size_class) -> str:
+    """Valeur PLAUSIBLE au format document (montant, date, entier, code), dont la
+    longueur dépend de la classe de taille. Remplace le charabia aléatoire :
+    la falsification ressemble à une vraie valeur éditée (montant/date/quantité)."""
+    lo, hi = _SIZE_NCHARS.get(size_class, (3, 8))
+    target = int(rng.integers(lo, hi + 1))
+    kind = str(rng.choice(["amount", "amount", "amount", "date", "int", "code"]))
+    if kind == "amount":
+        digits = max(1, min(6, target - 3))
+        whole = int(rng.integers(1, 10 ** digits))
+        s = f"{whole:,}".replace(",", ".")               # séparateur milliers style EU
+        return f"{s},{int(rng.integers(0, 100)):02d} €"
+    if kind == "date":
+        return (f"{int(rng.integers(1, 29)):02d}.{int(rng.integers(1, 13)):02d}."
+                f"{int(rng.integers(1995, 2025))}")
+    if kind == "int":
+        d = max(1, min(6, target))
+        return str(int(rng.integers(10 ** (d - 1), 10 ** d)))
+    letters = "".join(str(rng.choice(list(string.ascii_uppercase)))
+                      for _ in range(max(2, target // 3)))
+    return f"{letters}-{int(rng.integers(100, 9999))}"
+
+
 def _forge_substitution(rng, img, size_class, area_range, feather,
-                        min_w_px: int, min_h_px: int, forbid=None) -> ForgeResult:
-    """Peint des pixels neufs (texte) : aucune grille 8x8 Q0 antérieure."""
+                        min_w_px: int, min_h_px: int, forbid=None,
+                        content=None, min_content_frac=0.0) -> ForgeResult:
+    """Écrit une VALEUR PLAUSIBLE à la taille du texte du document.
+
+    Réalisme (isole le signal de compression, évite le « tell » du générateur) :
+    - police calée sur une hauteur de LIGNE réaliste (pas sur une grosse boîte) ;
+    - contenu = montant/date/quantité/code au format document (pas de charabia) ;
+    - édition SERRÉE : la boîte (= le masque) épouse le texte, pas de grand aplat.
+    + Lever 1 : placée sur du contenu ; + Lever 2 : encre sombre contrastée.
+    """
     H, W = img.shape[:2]
-    h, w, frac = _sample_size(rng, H, W, area_range, min_w_px, min_h_px)
-    y, x = _place_dest(rng, H, W, h, w, "N/A", forbid=forbid)
+    _check_min_fits(H, W, min_h_px, min_w_px, context="(substitution)")
+
+    # Hauteur de ligne = celle du TEXTE RÉEL du document (anti-tell), légèrement
+    # modulée (emphasis). Repli sur une fraction de page si trop peu de texte
+    # mesurable. Indépendante de toute grosse boîte -> plus de charabia géant.
+    emphasis = float(rng.uniform(*_SUBST_EMPHASIS))
+    doc_text_h = _estimate_text_height(img, content)
+    if doc_text_h is not None:
+        line_px = int(round(doc_text_h * emphasis))
+    else:
+        line_px = int(round(H * float(rng.uniform(*_LINE_H_FRAC)) * emphasis))
+    # Plancher renderable (8px) ; le plancher min_region_px est garanti par la
+    # boîte plus bas (`h = max(min_h_px, ...)`). Plafond de sécurité H//4.
+    line_px = max(8, min(line_px, H // 4))
+
+    # Valeur plausible + police, échelle calibrée pour atteindre `line_px`.
+    token = _plausible_token(rng, size_class)
+    font = _CV_FONTS[int(rng.integers(0, len(_CV_FONTS)))]
+    (_, th1), _ = cv2.getTextSize(token, font, 1.0, 1)
+    scale = max(0.3, line_px / max(th1, 1))
+    thickness = max(1, int(round(line_px / 14)))
+    (tw, th), base = cv2.getTextSize(token, font, scale, thickness)
+
+    pad = max(2, line_px // 6)
+    # Réduire l'échelle si le texte déborde en largeur de l'image.
+    if tw + 2 * pad > W - 2:
+        scale = max(0.3, scale * (W - 2) / float(tw + 2 * pad))
+        (tw, th), base = cv2.getTextSize(token, font, scale, thickness)
+
+    # Boîte SERRÉE autour du texte (= masque). Respecte le plancher min et l'image.
+    h = max(min_h_px, min(th + base + 2 * pad, H - 1))
+    w = max(min_w_px, min(tw + 2 * pad, W - 1))
+
+    y, x = _place_dest(rng, H, W, h, w, "N/A", forbid=forbid,
+                       content=content, min_content_frac=min_content_frac)
 
     region = img[y:y + h, x:x + w]
     # Fond échantillonné localement (médiane) -> cohérence photométrique.
-    bg = np.median(region.reshape(-1, 3), axis=0)
-    # Couleur du texte = pixels sombres locaux (l'encre est plus sombre que le fond).
+    bg = np.median(region.reshape(-1, 3), axis=0).astype(np.float64)
+    # Encre = pixels sombres locaux (l'encre est plus sombre que le fond).
     gray = region.reshape(-1, 3).mean(axis=1)
     dark_idx = gray <= np.percentile(gray, 15)
-    if dark_idx.any():
-        ink = region.reshape(-1, 3)[dark_idx].mean(axis=0)
-    else:
-        ink = np.clip(bg - 80, 0, 255)
+    ink = (region.reshape(-1, 3)[dark_idx].mean(axis=0).astype(np.float64)
+           if dark_idx.any() else bg.copy())
+    # Lever 2 : garantir une encre SOMBRE contrastée si la zone est claire/plate.
+    bg_lum, ink_lum = float(bg.mean()), float(ink.mean())
+    if bg_lum > 100.0 and (bg_lum - ink_lum) < _MIN_INK_CONTRAST:
+        ink = np.clip(bg * (_INK_TARGET_LUM / max(bg_lum, 1e-6)), 0, 255)
 
     patch = np.empty((h, w, 3), dtype=np.uint8)
     patch[:] = bg.astype(np.uint8)
-
-    # Texte synthétique plausible (montants/dates) rendu à l'échelle de la zone.
-    n_chars = max(2, int(rng.integers(3, 9)))
-    text = "".join(rng.choice(list(_TEXT_ALPHABET)) for _ in range(n_chars))
-    font = _CV_FONTS[int(rng.integers(0, len(_CV_FONTS)))]
-    # Ajuste la taille de police pour remplir ~70% de la hauteur de la zone.
-    scale = max(0.3, (h * 0.6) / 22.0)
-    thickness = max(1, int(round(h / 40)))
-    (tw, th), base = cv2.getTextSize(text, font, scale, thickness)
-    org_x = max(2, (w - tw) // 2)
-    org_y = min(h - 2, (h + th) // 2)
-    cv2.putText(patch, text, (org_x, org_y), font, scale,
+    org = (pad, pad + th)                       # origine putText (bas-gauche)
+    cv2.putText(patch, token, org, font, scale,
                 tuple(float(c) for c in ink), thickness, cv2.LINE_AA)
 
     edited = _composite(img, patch, y, x, h, w, feather)
     mask = _hard_mask(H, W, y, x, h, w)
+    frac = (h * w) / (H * W)
     return ForgeResult(
         image=edited, mask=mask, edit_type="substitution", size_class=size_class,
         alignment="N/A", bbox=[x, y, w, h], area_frac=round(frac, 6),
-        feather_radius=round(feather, 3), extra={"text": text},
+        feather_radius=round(feather, 3), extra={"text": token},
     )
 
 
 def _forge_copy_move(rng, img, size_class, area_range, alignment, feather,
-                     min_w_px: int, min_h_px: int, forbid=None) -> ForgeResult:
-    """Recopie une région de la MÊME image (porte la grille Q0)."""
+                     min_w_px: int, min_h_px: int, forbid=None,
+                     content=None, min_content_frac=0.0) -> ForgeResult:
+    """Recopie une région de la MÊME image (porte la grille Q0).
+
+    Lever 1 : SOURCE et DESTINATION préfèrent du contenu réel -> on copie une
+    vraie zone d'encre et on la colle sur une zone qui porte du contenu.
+    """
     H, W = img.shape[:2]
     h, w, frac = _sample_size(rng, H, W, area_range, min_w_px, min_h_px)
     # Source snappée sur la grille 8 -> on copie des blocs Q0 entiers, phase propre.
-    sy = _snap8(int(rng.integers(0, max(1, H - h))))
-    sx = _snap8(int(rng.integers(0, max(1, W - w))))
-    sy = max(0, min(sy, ((H - h) // JPEG_BLOCK) * JPEG_BLOCK))
-    sx = max(0, min(sx, ((W - w) // JPEG_BLOCK) * JPEG_BLOCK))
+    sy, sx = _pick_source(rng, H, W, h, w, content=content,
+                          min_content_frac=min_content_frac)
     patch = img[sy:sy + h, sx:sx + w].copy()
 
     # Éviter la région source ET les zones déjà falsifiées.
     y, x = _place_dest(rng, H, W, h, w, alignment,
-                       forbid=[[sx, sy, w, h], *(forbid or [])])
+                       forbid=[[sx, sy, w, h], *(forbid or [])],
+                       content=content, min_content_frac=min_content_frac)
     edited = _composite(img, patch, y, x, h, w, feather)
     mask = _hard_mask(H, W, y, x, h, w)
     return ForgeResult(
@@ -302,8 +461,13 @@ def _forge_copy_move(rng, img, size_class, area_range, alignment, feather,
 
 
 def _forge_splice(rng, img, donor, donor_id, size_class, area_range,
-                  alignment, feather, min_w_px: int, min_h_px: int, forbid=None) -> ForgeResult:
-    """Insère une région d'un AUTRE document (porte la grille Q0' du donneur)."""
+                  alignment, feather, min_w_px: int, min_h_px: int, forbid=None,
+                  content=None, min_content_frac=0.0, donor_content=None) -> ForgeResult:
+    """Insère une région d'un AUTRE document (porte la grille Q0' du donneur).
+
+    Lever 1 : la région SOURCE (dans le donneur) et la DESTINATION préfèrent du
+    contenu -> on insère de l'encre étrangère sur une zone porteuse de contenu.
+    """
     H, W = img.shape[:2]
     Hd, Wd = donor.shape[:2]
     # Taille limitée par la plus petite des deux images (dest ET donneur).
@@ -314,13 +478,12 @@ def _forge_splice(rng, img, donor, donor_id, size_class, area_range,
     h = _clip_to_min(h, min_h_px, usable_hd)
     w = _clip_to_min(w, min_w_px, usable_wd)
 
-    sy = _snap8(int(rng.integers(0, max(1, Hd - h))))
-    sx = _snap8(int(rng.integers(0, max(1, Wd - w))))
-    sy = max(0, min(sy, ((Hd - h) // JPEG_BLOCK) * JPEG_BLOCK))
-    sx = max(0, min(sx, ((Wd - w) // JPEG_BLOCK) * JPEG_BLOCK))
+    sy, sx = _pick_source(rng, Hd, Wd, h, w, content=donor_content,
+                          min_content_frac=min_content_frac)
     patch = donor[sy:sy + h, sx:sx + w].copy()
 
-    y, x = _place_dest(rng, H, W, h, w, alignment, forbid=forbid)
+    y, x = _place_dest(rng, H, W, h, w, alignment, forbid=forbid,
+                       content=content, min_content_frac=min_content_frac)
     edited = _composite(img, patch, y, x, h, w, feather)
     mask = _hard_mask(H, W, y, x, h, w)
     return ForgeResult(
@@ -344,6 +507,8 @@ def forge(
     donor_id: Optional[str] = None,
     min_region_px: Union[int, tuple, list] = JPEG_BLOCK,
     forbid: Optional[list] = None,
+    on_content: bool = False,
+    min_content_frac: float = 0.0,
 ) -> ForgeResult:
     """Point d'entrée : applique UNE falsification et renvoie image+masque+méta.
 
@@ -355,21 +520,32 @@ def forge(
     journalisé en erreur par l'orchestrator, jamais écrit en positif à masque
     vide). `forbid` = liste de bbox [x,y,w,h] déjà falsifiées à ne pas chevaucher
     (multi-falsification : appeler `forge` k fois en accumulant les bbox rendues).
+    `on_content` (Lever 1) : place la falsification sur du contenu réel (encre)
+    plutôt que dans le vide, avec `min_content_frac` = fraction min d'encre visée.
     """
     feather = float(rng.uniform(feather_range[0], feather_range[1]))
     min_w_px, min_h_px = normalize_min_region(min_region_px)
 
+    # Lever 1 : masques de contenu calculés une fois (best-effort au placement).
+    content = _content_mask(img) if on_content else None
+    mcf = float(min_content_frac) if on_content else 0.0
+
     if edit_type == "substitution":
         result = _forge_substitution(rng, img, size_class, area_range, feather,
-                                     min_w_px, min_h_px, forbid)
+                                     min_w_px, min_h_px, forbid,
+                                     content=content, min_content_frac=mcf)
     elif edit_type == "copy_move":
         result = _forge_copy_move(rng, img, size_class, area_range, alignment, feather,
-                                  min_w_px, min_h_px, forbid)
+                                  min_w_px, min_h_px, forbid,
+                                  content=content, min_content_frac=mcf)
     elif edit_type == "splice":
         if donor is None:
             raise ValueError("splice requiert une image donneuse (donor).")
+        donor_content = _content_mask(donor) if on_content else None
         result = _forge_splice(rng, img, donor, donor_id, size_class, area_range,
-                               alignment, feather, min_w_px, min_h_px, forbid)
+                               alignment, feather, min_w_px, min_h_px, forbid,
+                               content=content, min_content_frac=mcf,
+                               donor_content=donor_content)
     else:
         raise ValueError(f"type d'édition inconnu : {edit_type}")
 

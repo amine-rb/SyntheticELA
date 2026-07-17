@@ -29,21 +29,26 @@ import pyarrow.parquet as pq
 from orchestrator import load_config
 
 
-def compute_ela(rgb: np.ndarray, quality: int = 90) -> np.ndarray:
+def compute_ela(rgb: np.ndarray, quality: int = 90, scale: float = 15.0) -> np.ndarray:
     """Carte ELA (uint8, RGB) : différence absolue après un ré-encodage JPEG.
 
     La qualité ELA doit être DISTINCTE de Q2 (sinon la zone recompressée à Q2 ne
-    ressort pas). Étirement par max pour la visualisation.
+    ressort pas).
+
+    Lever 3 — ÉCHELLE GLOBALE FIXE (`scale`), identique pour toutes les images, au
+    lieu d'un étirement par le max de chaque image. L'ancien étirement par max
+    laissait le pixel le plus fort (logo, vrai texte) fixer l'échelle et écrasait
+    visuellement les falsifications faibles vers le noir. À échelle globale fixe,
+    l'aperçu reflète ce que « voit » le modèle (cf. `detection_eval.ELA_SCALE`) :
+    aligne `scale` sur cette valeur. La couleur est conservée (par canal) pour
+    révéler les franges chroma (logos/tampons).
     """
     buf = io.BytesIO()
     Image.fromarray(rgb, mode="RGB").save(buf, format="JPEG", quality=int(quality))
     buf.seek(0)
     recompressed = np.asarray(Image.open(buf).convert("RGB"), dtype=np.int16)
     diff = np.abs(rgb.astype(np.int16) - recompressed).astype(np.float32)
-    m = diff.max()
-    if m > 0:
-        diff = diff * (255.0 / m)
-    return diff.astype(np.uint8)
+    return np.clip(diff * float(scale), 0, 255).astype(np.uint8)
 
 
 def _panel(img_bgr, ela_bgr, mask, max_h=700):
@@ -60,7 +65,7 @@ def _panel(img_bgr, ela_bgr, mask, max_h=700):
 
 
 def run(cfg: dict, n_samples: int = 12, ela_quality: int = 90,
-        prefer_positive: bool = True) -> str:
+        prefer_positive: bool = True, scale: float = 15.0) -> str:
     out_root = cfg["paths"]["output_dir"]
     manifest_path = os.path.join(out_root, "manifest.parquet")
     if not os.path.exists(manifest_path):
@@ -84,7 +89,7 @@ def run(cfg: dict, n_samples: int = 12, ela_quality: int = 90,
         if mask is None:
             mask = np.zeros(rgb.shape[:2], dtype=np.uint8)
 
-        ela = compute_ela(rgb, ela_quality)
+        ela = compute_ela(rgb, ela_quality, scale=scale)
         img_bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
         ela_bgr = cv2.cvtColor(ela, cv2.COLOR_RGB2BGR)
         panel = _panel(img_bgr, ela_bgr, mask)
@@ -94,7 +99,7 @@ def run(cfg: dict, n_samples: int = 12, ela_quality: int = 90,
         cv2.imwrite(out, panel)
 
     print(f"[ela_preview] {len(sample)} planches écrites dans {prev_dir} "
-          f"(ELA Q{ela_quality}, distincte de Q2).")
+          f"(ELA Q{ela_quality}, distincte de Q2, échelle globale ×{scale:g}).")
     return prev_dir
 
 
@@ -104,14 +109,18 @@ def main() -> None:
     ap.add_argument("--out", default=None, help="Écrase paths.output_dir.")
     ap.add_argument("--n", type=int, default=None, help="Nb d'échantillons.")
     ap.add_argument("--ela-quality", type=int, default=None, help="Qualité ELA (distincte de Q2).")
+    ap.add_argument("--ela-scale", type=float, default=None,
+                    help="Échelle globale fixe de l'ELA (défaut config ela_preview.ela_scale=15).")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
     if args.out:
         cfg["paths"]["output_dir"] = args.out
-    n = args.n if args.n is not None else cfg["ela_preview"]["n_samples"]
-    q = args.ela_quality if args.ela_quality is not None else cfg["ela_preview"]["ela_quality"]
-    run(cfg, n_samples=n, ela_quality=q)
+    ela_cfg = cfg.get("ela_preview", {})
+    n = args.n if args.n is not None else ela_cfg["n_samples"]
+    q = args.ela_quality if args.ela_quality is not None else ela_cfg["ela_quality"]
+    s = args.ela_scale if args.ela_scale is not None else ela_cfg.get("ela_scale", 15.0)
+    run(cfg, n_samples=n, ela_quality=q, scale=float(s))
 
 
 if __name__ == "__main__":

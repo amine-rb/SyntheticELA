@@ -1,21 +1,49 @@
-# --- Données (corpus sources & sorties générées) ---
+# =============================================================================
+# .gitignore — SyntheticEla
+# On ne suit QUE le code + la doc. Aucune donnée (corpus sources, sorties
+# générées, caches) n'est versionnée.
+# =============================================================================
+
+# --- Données : corpus sources & sorties générées (jamais versionnées) --------
 StaVer/
 SROIE2019/
 output/
 output_staver/
+# Sorties de génération quel que soit leur emplacement (manifeste, planches QA, cache).
+**/_aggregated/
+**/ela_preview/
+*.parquet
+cache/
 
-# --- Python ---
+# --- Python ------------------------------------------------------------------
 __pycache__/
 *.py[cod]
 *.egg-info/
+build/
+dist/
 .venv/
 venv/
 .ipynb_checkpoints/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
-# --- OS / éditeurs ---
+# --- OS / éditeurs -----------------------------------------------------------
 .DS_Store
+Thumbs.db
+desktop.ini
 *.swp
+*.swo
+*~
 .idea/
 .vscode/
+
+# --- Environnement / logs / temporaires --------------------------------------
+.env
+*.log
+*.tmp
+tmp/
+
+# --- Notes personnelles (non publiées) ---------------------------------------
 instruction.md
 RAPPORT_STAVER.md

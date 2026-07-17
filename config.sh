@@ -26,6 +26,13 @@ Q2_SWEEP=(55 70 85 95)                       # couvre Q2<Q1, Q2≈Q1, Q2>Q1
 Q1_MODE=auto                                 # native | controlled | auto
 Q1_AUTO_Q0_THRESHOLD=95                      # Q0 médian >= seuil -> controlled (mode auto)
 Q1_SWEEP=(55 70 85)                          # utilisé si controlled ; ⊆ Q2_SWEEP
+# Écart MINIMAL imposé |Q1 - Q2| (mode controlled uniquement). Q1==Q2 (écart 0)
+# rend la double compression quasi idempotente : le fond (Q1->Q2) ≈ la zone
+# falsifiée (simple Q2) -> signal dégénéré, quasi indétectable par la compression.
+# On ne tire donc QUE des couples (Q1,Q2) espacés d'au moins ce seuil, AUSSI BIEN
+# pour les positifs que pour les négatifs (sinon "Q1==Q2" prédirait l'authenticité).
+# 0 = désactivé (autorise la diagonale). 15 = recommandé sur ce sweep.
+Q1Q2_MIN_GAP=15
 
 # --- Falsification -----------------------------------------------------------
 # Types à générer : UN SOUS-DOSSIER COMPLET ET SÉPARÉ par type (aucun tirage
@@ -43,6 +50,12 @@ MIN_REGION_PX=(10 10)
 # est grand, plus les zones sont PETITES (plafond de taille auto) pour ne pas
 # couvrir toute la page : ex. k=5 -> uniquement des zones "small". (1 1) = une seule.
 N_FORGERIES=(1 5)
+# Placer les falsifications SUR du contenu réel (texte/chiffres) au lieu du vide
+# -> zones réalistes et porteuses de signal ELA (pas d'aplat blanc invisible).
+# MIN_CONTENT_FRAC = fraction min de pixels "encre" visée dans la zone (best-effort ;
+# retombe sur le meilleur emplacement si la page est presque vide).
+PLACE_ON_CONTENT=true
+MIN_CONTENT_FRAC=0.02
 
 # --- Classes de taille de zone (fraction de surface page : MIN MAX) ----------
 SIZE_SMALL=(0.001 0.005)                     # ~0.1% – 0.5% de la page
@@ -63,6 +76,9 @@ PATCH_POSITIVE_OVERLAP=0.5                   # patch positif si recouvrement > s
 # --- QA visuel (planches ELA) ------------------------------------------------
 ELA_QUALITY=90                               # qualité ELA d'aperçu, DISTINCTE de Q2
 ELA_N_SAMPLES=50                             # nb de planches image | ELA | masque
+# Échelle GLOBALE FIXE de l'ELA d'aperçu (pas d'étirement par max d'image, qui
+# écrasait les fraudes faibles). Aligne-la sur detection_eval.ELA_SCALE (=15).
+ELA_SCALE=15
 
 # --- Orchestration -----------------------------------------------------------
 SEED=42                                      # seed global (reproductibilité)

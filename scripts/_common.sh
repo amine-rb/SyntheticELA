@@ -40,6 +40,7 @@ gen_config() {
         echo "  q1_mode: ${Q1_MODE}"
         echo "  q1_auto_q0_threshold: ${Q1_AUTO_Q0_THRESHOLD}"
         echo "  q1_sweep: [$(IFS=', '; echo "${Q1_SWEEP[*]}")]"
+        echo "  q1q2_min_gap: ${Q1Q2_MIN_GAP}"
 
         echo "forger:"
         echo "  edit_types:"
@@ -49,6 +50,8 @@ gen_config() {
         echo "  splice_source: \"${SPLICE_SOURCE}\""
         echo "  min_region_px: [${MIN_REGION_PX[0]}, ${MIN_REGION_PX[1]}]"
         echo "  n_forgeries: [${N_FORGERIES[0]}, ${N_FORGERIES[1]}]"
+        echo "  place_on_content: ${PLACE_ON_CONTENT}"
+        echo "  min_content_frac: ${MIN_CONTENT_FRAC}"
 
         echo "size_classes:"
         echo "  small:      [${SIZE_SMALL[0]}, ${SIZE_SMALL[1]}]"
@@ -69,6 +72,7 @@ gen_config() {
         echo "ela_preview:"
         echo "  ela_quality: ${ELA_QUALITY}"
         echo "  n_samples: ${ELA_N_SAMPLES}"
+        echo "  ela_scale: ${ELA_SCALE}"
 
         echo "orchestrator:"
         echo "  seed: ${SEED}"

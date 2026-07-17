@@ -85,7 +85,9 @@ d'historique de compression** entre les zones falsifiées et le reste du documen
 que l'ELA révèle.
 
 Trois types d'édition :
-- **substitution** — pixels neufs peints (texte) : pas de grille 8×8 antérieure (`alignment = N/A`).
+- **substitution** — écrit une **valeur plausible** (montant, date, quantité, code au
+  format document) à la **taille du texte du document**, en encre sombre, sur du
+  contenu existant ; pas de grille 8×8 antérieure (`alignment = N/A`).
 - **copy_move** — région recopiée de la même image (porte la grille Q1) ; offset ×8 → aligné, sinon désaligné.
 - **splice** — région d'un autre document du corpus (grille étrangère) ; même contrôle d'alignement.
 
@@ -114,6 +116,33 @@ rectangle falsifié quel que soit la classe ou l'image source, arrondi au **mult
 8 supérieur** (grille JPEG) — `(10 10)` ⇒ minimum réel `16×16`. Si une source est trop
 petite pour l'accueillir sur un axe, le document **échoue proprement** (erreur
 journalisée par l'orchestrator) au lieu d'écrire un positif à **masque vide**.
+
+**Placement sur contenu réel** (`PLACE_ON_CONTENT=true`, `MIN_CONTENT_FRAC`) : les
+falsifications visent une zone portant du **texte/chiffres** (détection d'encre par
+Otsu) au lieu des marges blanches — scénario réaliste (un fraudeur modifie une valeur
+existante) **et** signal ELA exploitable. `MIN_CONTENT_FRAC` = fraction d'encre visée
+(best-effort ; retombe sur le meilleur emplacement si la page est presque vide). Pour
+la substitution, l'**encre** est en outre forcée sombre/contrastée (vrais bords → vrai
+signal), et le splice/copy-move copient une **vraie zone d'encre**. Sans ce placement,
+un aplat sur marge blanche produit une zone quasi invisible en ELA (« trou propre »).
+
+**Substitution réaliste** : la valeur injectée est **plausible** (montant/date/code au
+format document) et rendue à la **taille du texte RÉEL du document** — hauteur des
+glyphes **mesurée** par composantes connexes du masque d'encre (pas une fraction
+devinée), légèrement modulée (`×0,9–1,3`), dans une boîte **serrée** autour du texte.
+Le glyphe injecté fait donc ≈ **1× le corps de texte** du document (~1 % de la hauteur
+de page), au lieu de ~3× auparavant. But : que la détection soit attribuable à
+l'**incohérence de compression** et non à un artefact du générateur (gros texte /
+charabia) — cf. le « tell » du générateur, `markdown/plan.md` §8.
+
+> Multi-falsification : `bbox_*` du manifeste est l'**englobante de l'union** des k
+> zones (donc large si elles sont dispersées) ; les rectangles individuels sont dans
+> le JSON, champ `forgery_bboxes`.
+
+> Aperçu QA (`ELA_SCALE`) : `./scripts/preview.sh` calcule l'ELA à **échelle globale
+> fixe** (défaut 15, à aligner sur `detection_eval.ELA_SCALE`) au lieu d'un étirement
+> par le max de chaque image — l'aperçu reflète ce que « voit » le modèle et n'écrase
+> plus les fraudes faibles.
 
 ---
 
@@ -186,7 +215,15 @@ perte (Q0≈100) — **mesuré**, pas supposé (ratio ELA dans/hors masque) :
 En native sur Q0≈100, le fond n'est quasi pas double-compressé → signal faible. En
 controlled, le fond devient réellement double-compressé et le signal net **et dépendant
 du régime** (Q2<Q1 écrase le signal, limite physique attendue). `Q1_SWEEP ⊆ Q2_SWEEP`
-garantit la couverture des trois régimes. Q0 reste toujours **lu et journalisé**.
+garantit la couverture des régimes. Q0 reste toujours **lu et journalisé**.
+
+**Écart minimal Q1↔Q2** (`Q1Q2_MIN_GAP`, mode controlled) : quand `Q1 == Q2`, la
+seconde compression est quasi **idempotente** → le fond (Q1→Q2) devient
+indiscernable de la zone falsifiée (simple Q2) : **signal dégénéré**. Le planificateur
+ne tire donc que des couples `(Q1, Q2)` espacés d'au moins `Q1Q2_MIN_GAP` (défaut 15),
+ce qui **exclut la diagonale** `Q1==Q2` tout en couvrant `Q2<Q1` et `Q2>Q1`. La
+contrainte s'applique **identiquement aux positifs et aux négatifs** : sinon `Q1==Q2`
+deviendrait un prédicteur parfait d'authenticité (fuite d'étiquette). `0` = désactivé.
 
 > Un corpus PNG **doit** utiliser `controlled` (pas de Q0) : le pipeline le force et
 > lève une erreur explicite si on demande `native`.
@@ -202,14 +239,16 @@ garantit la couverture des trois régimes. Q0 reste toujours **lu et journalisé
 | `SOURCE_DIR`, `OUTPUT_DIR` | corpus source & racine de sortie |
 | `CANDIDATE_EXT`, `ALLOW_LOSSLESS` | extensions acceptées, prise en charge lossless (PNG) |
 | `Q2_SWEEP`, `Q1_MODE`, `Q1_SWEEP`, `Q1_AUTO_Q0_THRESHOLD` | balayage de compression |
+| `Q1Q2_MIN_GAP` | écart min `\|Q1−Q2\|` imposé (controlled) — exclut la diagonale dégénérée `Q1==Q2` (§7) |
 | `EDIT_TYPES` | types générés — **un sous-dossier par type** |
 | `N_FORGERIES` | `(min max)` falsifications par doc — plafond de taille auto (§4) |
 | `MIN_REGION_PX` | `(largeur hauteur)` taille min garantie de zone (§4) |
+| `PLACE_ON_CONTENT`, `MIN_CONTENT_FRAC` | placer les fraudes sur du contenu réel (§4) |
 | `ALIGNED_RATIO`, `FEATHER_RADIUS_PX` | alignement grille 8×8, adoucissement anti-tell |
 | `SIZE_SMALL … SIZE_VERY_LARGE` | tailles de zone (fraction de page, min max) |
 | `NEGATIVES_RATIO` | part d'authentiques par sous-dossier (`0.0` = que des fraudes) |
 | `INPUT_RES`, `PATCH_SIZE`, `PATCH_GRID`, `PATCH_POSITIVE_OVERLAP` | grille patch |
-| `ELA_QUALITY`, `ELA_N_SAMPLES` | QA visuel |
+| `ELA_QUALITY`, `ELA_N_SAMPLES`, `ELA_SCALE` | QA visuel (échelle ELA globale fixe) |
 | `SEED`, `N_DOCS`, `N_WORKERS` | reproductibilité, lot **par type**, parallélisme |
 | `PYTHON` | interpréteur (celui qui a les dépendances) |
 

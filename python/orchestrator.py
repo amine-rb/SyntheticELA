@@ -119,6 +119,22 @@ def plan_jobs(cfg: dict, source_paths: list[str], edit_type: str,
     # (Q1 imposé, échantillonné dans q1_sweep -> alimente les régimes de E5).
     q1_mode = cfg["compression"].get("q1_mode", "native")
     q1_sweep = cfg["compression"].get("q1_sweep", [])
+    controlled = (q1_mode == "controlled") and bool(q1_sweep)
+    # Écart minimal |Q1-Q2| : en controlled, on ne stratifie QUE sur les couples
+    # (Q1,Q2) espacés d'au moins ce seuil. Q1==Q2 (écart 0) est dégénéré (double
+    # compression quasi idempotente -> fond ≈ zone), donc exclu par défaut. La
+    # contrainte s'applique AVANT la branche négatif/positif : positifs et négatifs
+    # partagent EXACTEMENT la même loi (Q1,Q2) -> aucune fuite (Q1,Q2)->authenticité.
+    q1q2_gap = int(cfg["compression"].get("q1q2_min_gap", 0))
+    valid_pairs = None
+    if controlled:
+        valid_pairs = [(int(a), int(b)) for a in q1_sweep for b in q2_sweep
+                       if abs(int(a) - int(b)) >= q1q2_gap]
+        if not valid_pairs:
+            raise ValueError(
+                f"Aucun couple (Q1,Q2) avec |Q1-Q2| >= {q1q2_gap} "
+                f"(q1_sweep={list(q1_sweep)}, q2_sweep={list(q2_sweep)}). "
+                "Réduis compression.q1q2_min_gap ou élargis les sweeps.")
     neg_ratio = float(cfg["negatives"]["ratio"])
     aligned_ratio = float(cfg["forger"]["aligned_ratio"])
     # size_classes ORDONNÉES du plus petit au plus grand (ordre du config).
@@ -133,11 +149,15 @@ def plan_jobs(cfg: dict, source_paths: list[str], edit_type: str,
         seed = int(master.integers(0, 2**31 - 1))
         jrng = np.random.default_rng(seed)
 
-        q2 = int(q2_sweep[i % len(q2_sweep)])          # stratifié -> couverture
-        # Q1 contrôlé : grille cartésienne Q1×Q2 (couvre Q1<Q2, Q1=Q2, Q1>Q2 pour E5).
-        q1 = None
-        if q1_mode == "controlled" and q1_sweep:
-            q1 = int(q1_sweep[(i // len(q2_sweep)) % len(q1_sweep)])
+        # Couple (Q1,Q2) STRATIFIÉ pour une couverture déterministe et équilibrée.
+        # - controlled : on cycle sur les couples valides (|Q1-Q2|>=gap) -> couvre
+        #   Q2<Q1 ET Q2>Q1 (régimes E5), diagonale Q1==Q2 exclue.
+        # - native     : Q1=Q0 (lu par source), Q2 seul stratifié sur le sweep.
+        if controlled:
+            q1, q2 = valid_pairs[i % len(valid_pairs)]
+        else:
+            q1 = None
+            q2 = int(q2_sweep[i % len(q2_sweep)])
         source_path = str(master.choice(source_paths))
         is_negative = bool(master.random() < neg_ratio)
         # Nommage HONNÊTE : un négatif n'est PAS une falsification du type courant.
@@ -221,6 +241,9 @@ def _run_job(job: Job, cfg: dict, out_dirs: dict, nonstd_thr: float) -> dict:
             # (donneur JPEG : historique natif Q0 conservé, déjà étranger au fond.)
         # int (carré) ou [largeur_min, hauteur_min] ; normalisé dans forger.forge().
         min_region_px = cfg["forger"].get("min_region_px", forger_mod.JPEG_BLOCK)
+        # Lever 1 : placement sur du contenu réel (encre) plutôt que dans le vide.
+        on_content = bool(cfg["forger"].get("place_on_content", False))
+        min_content_frac = float(cfg["forger"].get("min_content_frac", 0.0))
 
         # ---- k falsifications (MÊME type, MÊME classe de taille) accumulées ----
         # Chaque passe édite l'image courante et évite les zones déjà falsifiées
@@ -235,6 +258,7 @@ def _run_job(job: Job, cfg: dict, out_dirs: dict, nonstd_thr: float) -> dict:
                 feather_range=feather_range, rng=rng,
                 donor=donor_rgb, donor_id=donor_id,
                 min_region_px=min_region_px, forbid=forgery_bboxes,
+                on_content=on_content, min_content_frac=min_content_frac,
             )
             edited = forge_res.image
             mask = np.maximum(mask, forge_res.mask)
