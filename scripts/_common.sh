@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# _common.sh — sourcé par run.sh / aggregate.sh / preview.sh.
+# _common.sh — sourcé par run.sh / aggregate.sh / ela.sh.
 # Charge config.sh, localise Python + le code, et génère la config YAML interne
 # (détail d'implémentation : le seul fichier que l'utilisateur édite est config.sh).
 set -euo pipefail
@@ -66,7 +66,7 @@ gen_config() {
         echo "  patch_grid: ${PATCH_GRID}"
         echo "  patch_positive_overlap: ${PATCH_POSITIVE_OVERLAP}"
 
-        echo "ela_preview:"
+        echo "ela:"
         echo "  ela_quality: ${ELA_QUALITY}"
         echo "  ela_spread: ${ELA_SPREAD}"
         echo "  n_samples: ${ELA_N_SAMPLES}"

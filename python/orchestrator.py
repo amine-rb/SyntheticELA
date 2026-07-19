@@ -80,7 +80,7 @@ def compute_ela_stack(img_path: str, qualities: list[int], scale: float) -> np.n
     Canal k = |image - recompress(image, qualities[k])| moyennée sur canaux, à
     échelle GLOBALE fixe (`scale`), résolution NATIVE (aligné pixel avec image/masque).
     L'ordre des canaux (R,G,B) = (q_bas, q_moyen, q_haut). Encodeur PIL (cohérent
-    avec `ela_preview` / `detection_eval`).
+    avec `ela_scan` / `detection_eval`).
     """
     rgb = np.asarray(Image.open(img_path).convert("RGB"), dtype=np.int16)
     chans = []
@@ -345,7 +345,7 @@ def _run_job(job: Job, cfg: dict, out_dirs: dict, nonstd_thr: float) -> dict:
     cv2.imwrite(mask_path, mask)
 
     # ---- ELA (3 qualités -> RGB) sur le JPEG FINAL re-lu -> dossier ela/ ----
-    ela_cfg = cfg.get("ela_preview", {})
+    ela_cfg = cfg.get("ela", cfg.get("ela_preview", {}))
     ela_center = int(ela_cfg.get("ela_quality", 90))
     ela_spread = int(ela_cfg.get("ela_spread", 8))
     ela_qs = ela_qualities(ela_center, ela_spread)
@@ -499,7 +499,7 @@ def run(cfg: dict, limit: Optional[int] = None, workers: Optional[int] = None) -
     # nativement — l'historique vient entièrement de la passe Q1.
     sweep = [int(q) for q in cfg["compression"]["quality_sweep"]]
     gap = int(cfg["compression"].get("q1_gap", 0))
-    ela_q = int(cfg.get("ela_preview", {}).get("ela_quality", 90))
+    ela_q = int(cfg.get("ela", cfg.get("ela_preview", {})).get("ela_quality", 90))
     q1_vals = sorted({max(40, q - gap) for q in sweep})
     q1_reco = int(round(float(np.median(q1_vals))))   # sonde optimale ≈ Q1 (point fixe du fond)
     # GARDE-FOU DUR : si une Q2 du sweep == qualité de sonde ELA, toute l'image est au

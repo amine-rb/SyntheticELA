@@ -33,7 +33,7 @@ Edit `config.sh` (paths, sweep, edit types, sizes, etc. — every parameter live
 ```bash
 ./scripts/run.sh          # generate: one self-contained subfolder per edit type
 ./scripts/aggregate.sh    # merge chosen type subfolders -> OUTPUT_DIR/_aggregated/
-./scripts/preview.sh      # QA contact sheets (image | ELA | mask) for one subfolder
+./scripts/ela.sh --in DIR/IMAGES --out DIR/ELA   # ELA RGB (3 qualities ≈ Q1) on ANY image folder
 ```
 
 One-off CLI overrides without touching `config.sh`:
@@ -41,7 +41,7 @@ One-off CLI overrides without touching `config.sh`:
 ```bash
 ./scripts/run.sh --src OTHER/DIR --out OTHER/OUT --n 500 --workers 8
 ./scripts/aggregate.sh --types substitution splice --mode symlink
-./scripts/preview.sh --out "$OUTPUT_DIR/_aggregated" --n 20
+./scripts/ela.sh --in real_docs/ --out real_docs_ela/ --recursive   # forged OR authentic, no manifest/mask needed
 ```
 
 Regenerate a run's report standalone:
@@ -130,13 +130,14 @@ loudly rather than emitting a degenerate empty-mask positive.
 | `orchestrator.py` | Batch driver: probes the corpus, plans deterministic per-document jobs (seed derived from the global seed, independent of worker/order), runs `forger -> recompress -> annotator` in a `ProcessPoolExecutor`, writes the manifest. Also owns `load_config` (YAML → config), consumed by other modules. |
 | `aggregate.py` | Merges the per-type output subfolders into `_aggregated/` (copy/symlink/hardlink), concatenating manifests with a re-filterable `type` column. |
 | `reporter.py` | Builds each run's `REPORT.md` (source/quality, composition, integrity checks, sampled ELA separability by type). |
-| `ela_preview.py` | Renders image\|ELA\|mask QA contact sheets at a fixed global ELA scale, using the **same RGB 3-quality (≈`Q1`) stack** as the generated output (`orchestrator.compute_ela_stack`). |
+| `ela_scan.py` | Standalone: computes ELA RGB (**same 3-quality ≈`Q1` stack** as the generated output, `orchestrator.compute_ela_stack`) over **any raw image folder** (forged or authentic, no manifest/mask needed) → one `*_ela.png` per image + `ela.csv`. Driven by `scripts/ela.sh`. |
 | `main.py` | Thin CLI entry point invoked by `run.sh`; delegates to `orchestrator.main()`. |
 | `detection_eval.py` | Standalone eval module meant to be **copied into the downstream training codebase** (torch/sklearn/scipy) — ELA cache building, dev/authentic datasets, best-detection-checkpoint tracking, and the final AUPRC/AUPRO/Dice/IoU evaluation protocol. Not exercised by the generation pipeline itself. |
 
 Import direction is strictly one-way: `orchestrator` imports `jpeg_probe`, `recompress`, `forger`,
-`annotator`; `ela_preview` and `reporter` read already-generated output plus `orchestrator.
-load_config`; `detection_eval` has no dependency on the rest of `python/` (it's copied elsewhere).
+`annotator`; `reporter` reads already-generated output plus `orchestrator.load_config`; `ela_scan`
+reuses `orchestrator.compute_ela_stack`/`ela_qualities`/`load_config` but needs no generated output;
+`detection_eval` has no dependency on the rest of `python/` (it's copied elsewhere).
 
 ### Output layout
 
@@ -157,8 +158,11 @@ downstream train/eval, no cross-references to other types):
     distribution.json                 # copy of the corpus probe (self-contained)
     run_config.yaml                   # frozen effective config for this run
     REPORT.md                         # human-readable run report
-    ela_preview/                      # image|ELA|mask QA sheets (after ./scripts/preview.sh)
 ```
+
+`./scripts/ela.sh --in <folder> --out <folder>` writes ELA RGB (`*_ela.png` + `ela.csv`) for any
+image folder — independent of the generation layout above; use it to run the exact same ELA on
+external / real documents (Q1 unknown — see the probe-≈`Q1` caveat below).
 
 Three per-artifact folders each carry a self-contained CSV (`images/`, `masks/`, `ela/`), so a
 folder can be loaded without the Parquet manifest. ELA is a first-class output computed at

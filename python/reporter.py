@@ -126,7 +126,7 @@ def write_report(out_root: str, ela_quality: int | None = None, ela_sample: int 
     # Par défaut, mesurer à la qualité de sonde RÉELLE du run (≈ Q1), pas un 90 figé :
     # sinon le rapport sous-estime le signal (mesuré ailleurs qu'à l'optimum).
     if ela_quality is None:
-        ela_quality = int(cfg.get("ela_preview", {}).get("ela_quality", 90)) if cfg else 90
+        ela_quality = int(cfg.get("ela", cfg.get("ela_preview", {})).get("ela_quality", 90)) if cfg else 90
     n = len(rows)
     pos = [r for r in rows if not r["is_negative"]]
     neg = [r for r in rows if r["is_negative"]]

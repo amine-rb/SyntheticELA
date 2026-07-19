@@ -13,7 +13,9 @@
 
 # --- Chemins -----------------------------------------------------------------
 SOURCE_DIR="/Users/amine_rb/Desktop/Master IASD/coding/SyntheticEla/StaVer/scans/scans"   # dossier des images sources
-OUTPUT_DIR="/Users/amine_rb/Desktop/Master IASD/coding/SyntheticEla/StaVer/scans/fraud"    # racine des sorties
+OUTPUT_DIR="/Users/amine_rb/Desktop/Master IASD/coding/SyntheticEla/StaVer/scans/fraud"   # dossier des images sources
+# SOURCE_DIR="/Users/amine_rb/Desktop/Master IASD/coding/SyntheticEla/SROIE2019/train/img"   # dossier des images sources
+# OUTPUT_DIR="/Users/amine_rb/Desktop/Master IASD/coding/SyntheticEla/SROIE2019/train/fraud"    # racine des sorties
 
 # --- Sonde du corpus ---------------------------------------------------------
 PROBE_RECURSIVE=true                         # parcourt les sous-dossiers

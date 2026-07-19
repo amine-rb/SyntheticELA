@@ -20,7 +20,7 @@ config.sh          <- LE seul fichier à éditer (tous les paramètres)
 scripts/           <- LES seules commandes à lancer
    run.sh          - génération (un sous-dossier autonome par type)
    aggregate.sh    - fusion des sous-dossiers de types -> _aggregated/
-   preview.sh      - planches QA image | ELA | masque
+   ela.sh          - ELA RGB (mêmes paramètres) sur un dossier d'images quelconque
    _common.sh      - interne (charge config.sh, génère la config, localise python)
 python/            <- code (10 modules ; usage normal = ne pas toucher)
 markdown/          <- plan de recherche, schéma roadmap, notes
@@ -53,7 +53,7 @@ Deux étapes :
 ```bash
 ./scripts/run.sh          # génère un sous-dossier autonome par type d'édition
 ./scripts/aggregate.sh    # (option) fusionne -> OUTPUT_DIR/_aggregated/
-./scripts/preview.sh      # (option) planches QA du 1er type
+./scripts/ela.sh --in DOSSIER/IMAGES --out DOSSIER/ELA   # ELA RGB sur un dossier quelconque
 ```
 
 Surcharge ponctuelle en CLI, sans éditer `config.sh` :
@@ -61,7 +61,7 @@ Surcharge ponctuelle en CLI, sans éditer `config.sh` :
 ```bash
 ./scripts/run.sh --src AUTRE/DOSSIER --out AUTRE/SORTIE --n 500 --workers 8
 ./scripts/aggregate.sh --types substitution splice --mode symlink
-./scripts/preview.sh --out "$OUTPUT_DIR/_aggregated" --n 20
+./scripts/ela.sh --in real_docs/ --out real_docs_ela/ --recursive   # falsifié OU authentique
 ```
 
 Sources JPEG **ou** PNG : deux qualités `Q1 < Q2` par document (base puis save
@@ -153,7 +153,7 @@ charabia) — cf. le « tell » du générateur, `markdown/plan.md` §8.
 > zones (donc large si elles sont dispersées) ; les rectangles individuels sont dans
 > le JSON, champ `forgery_bboxes`.
 
-> Aperçu QA (`ELA_SCALE`) : `./scripts/preview.sh` calcule l'ELA à **échelle globale
+> ELA sur dossier (`ELA_SCALE`) : `./scripts/ela.sh --in … --out …` calcule l'ELA à **échelle globale
 > fixe** (défaut 15, à aligner sur `detection_eval.ELA_SCALE`) au lieu d'un étirement
 > par le max de chaque image — l'aperçu reflète ce que « voit » le modèle et n'écrase
 > plus les fraudes faibles.
@@ -179,8 +179,11 @@ manque aucune info pour l'entraînement/évaluation en aval) :
      distribution.json                 # sonde du corpus (copie, self-contained)
      run_config.yaml                   # config effective figée
      REPORT.md                         # rapport lisible des résultats  ← §6
-     ela_preview/                      # planches QA image|ELA|masque (après ./scripts/preview.sh)
 ```
+
+> ELA hors pipeline : `./scripts/ela.sh --in <dossier> --out <dossier>` produit `*_ela.png` + `ela.csv`
+> (mêmes qualités ≈ Q1 et échelle que la génération) pour **n'importe quel dossier d'images**, falsifié
+> ou non — utile pour appliquer l'ELA à de vrais documents (Q1 inconnu : voir §7).
 
 **Trois dossiers, un CSV chacun** (`images/`, `masks/`, `ela/`) : chaque CSV est
 autonome (une ligne par document, nom de fichier + métadonnées) → on charge un
@@ -314,7 +317,7 @@ Surcharges CLI (sans éditer `config.sh`) : `--src`, `--out`, `--n`, `--workers`
 | `orchestrator`| Batch scriptable, un sous-dossier autonome par type, seeds déterministes, mode Q1 auto, manifeste. |
 | `aggregate`   | Fusionne les sous-dossiers de types en un dataset unique (`_aggregated/`). |
 | `reporter`    | `REPORT.md` (résultats du run + séparabilité ELA). |
-| `ela_preview` | Planches QA image \| ELA \| masque (même ELA RGB 3 qualités ≈ Q1 que la sortie). |
+| `ela_scan`    | ELA RGB 3 qualités ≈ Q1 (mêmes paramètres que la sortie) sur un dossier d'images quelconque, falsifié ou non. |
 | `main`        | Point d'entrée appelé par `run.sh`. |
 | `detection_eval` | Évaluation détection/localisation AnoViT (§11) — à copier dans le codebase d'entraînement. |
 
