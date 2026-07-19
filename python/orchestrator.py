@@ -22,8 +22,13 @@ Sous-échantillonnage des types / tailles / alignement
   Ils empêchent le modèle d'apprendre la double compression GLOBALE au lieu de
   LOCALISER l'incohérence. Les éléments bénins colorés (logos, tampons) sont
   conservés par construction : on part de vrais reçus, on ne les retire jamais.
-- Q2 : STRATIFIÉ sur le sweep (i % len(sweep)) pour garantir la couverture de
-  Q2<Q0 / Q2≈Q0 / Q2>Q0 nécessaire à l'ablation E5.
+- Qualité : DEUX passes Q1 < Q2 par document. Q2 (sauvegarde finale, haute) est
+  stratifiée sur le sweep (i % len) ; Q1 = Q2 - q1_gap (base plus basse). La source
+  est recompressée à Q1 (historique du "document original"), la substitution est
+  peinte en pixels NEUFS (jamais vus par Q1), puis sauvegarde finale à Q2 -> le
+  texte authentique porte l'historique Q1->Q2, la zone falsifiée n'a que Q2. En ELA
+  (sondée à une qualité != Q2), la zone ressort du texte ordinaire (~2.6x). L'écart
+  Q1<Q2 est IMPÉRATIF : en Q1==Q2 la falsification est indiscernable (ratio ~1.0).
 - Types / tailles : tirés selon les ratios de la config (tailles équiprobables).
 - Alignement : sur copy_move + splice uniquement, selon `aligned_ratio`.
 
@@ -33,6 +38,8 @@ Dépendances : Pillow, NumPy, OpenCV, PyYAML, PyArrow.
 from __future__ import annotations
 
 import argparse
+import csv
+import io
 import json
 import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -44,6 +51,7 @@ import cv2
 import yaml
 import pyarrow as pa
 import pyarrow.parquet as pq
+from PIL import Image
 
 import jpeg_probe
 from recompress import decode_source, save_q2, recompress_to_q1, DEFAULT_Q2_SUBSAMPLING
@@ -52,6 +60,75 @@ import annotator as ann
 
 
 _SUBSAMPLING_INT2STR = {0: "4:4:4", 1: "4:2:2", 2: "4:2:0"}
+
+
+# ------------------------------------------------------------------ ELA + CSV
+def ela_qualities(center: int, spread: int) -> list[int]:
+    """3 qualités de sonde ELA (canaux R,G,B) = (centre-spread, centre, centre+spread).
+
+    Le centre vise ≈ Q1 (point fixe du fond) pour le contraste max ; l'écart `spread`
+    donne 3 vues décorrélées -> une IMAGE COULEUR dont la teinte encode la réaction
+    différentielle aux 3 sondes (le signal vient de la DIVERSITÉ de qualité, pas de
+    la chroma). Bornées dans [40, 99]. Alimente `detection_eval` mode E2.
+    """
+    return [int(np.clip(center + d, 40, 99)) for d in (-spread, 0, spread)]
+
+
+def compute_ela_stack(img_path: str, qualities: list[int], scale: float) -> np.ndarray:
+    """Pile ELA 3 qualités -> (H, W, 3) uint8 RGB, sur le JPEG FINAL re-lu.
+
+    Canal k = |image - recompress(image, qualities[k])| moyennée sur canaux, à
+    échelle GLOBALE fixe (`scale`), résolution NATIVE (aligné pixel avec image/masque).
+    L'ordre des canaux (R,G,B) = (q_bas, q_moyen, q_haut). Encodeur PIL (cohérent
+    avec `ela_preview` / `detection_eval`).
+    """
+    rgb = np.asarray(Image.open(img_path).convert("RGB"), dtype=np.int16)
+    chans = []
+    for q in qualities:
+        buf = io.BytesIO()
+        Image.fromarray(rgb.astype(np.uint8), "RGB").save(buf, "JPEG", quality=int(q))
+        buf.seek(0)
+        rec = np.asarray(Image.open(buf).convert("RGB"), dtype=np.int16)
+        diff = np.abs(rgb - rec).mean(axis=2)          # ELA luminance à cette qualité
+        chans.append(np.clip(diff * float(scale), 0, 255).astype(np.uint8))
+    return np.stack(chans, axis=2)                      # (H, W, 3) RGB
+
+
+def _bn(rel: Optional[str]) -> str:
+    """Nom de fichier depuis un chemin relatif (vide si None)."""
+    return os.path.basename(rel) if rel else ""
+
+
+def write_folder_csvs(sub_root: str, rows: list[dict]) -> None:
+    """Écrit un CSV par dossier (images / masks / ela) pour faciliter la reprise.
+
+    Chaque CSV est autonome (une ligne par document, nom de fichier + métadonnées
+    utiles) : on peut charger un dossier sans lire le manifeste Parquet global.
+    """
+    if not rows:
+        return
+    with open(os.path.join(sub_root, "images", "images.csv"), "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["id", "image", "type", "is_negative", "quality",
+                    "size_class", "n_forgeries", "source_id", "seed"])
+        for r in rows:
+            w.writerow([r["id"], _bn(r["path_img"]), r["type"], r["is_negative"],
+                        r["q2"], r["size_class"], r["n_forgeries"], r["source_id"], r["seed"]])
+    with open(os.path.join(sub_root, "masks", "masks.csv"), "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["id", "mask", "json", "is_negative", "n_forgeries", "n_mask_px",
+                    "mask_frac", "bbox_x", "bbox_y", "bbox_w", "bbox_h"])
+        for r in rows:
+            w.writerow([r["id"], _bn(r["path_mask"]), _bn(r["path_json"]), r["is_negative"],
+                        r["n_forgeries"], r["n_mask_px"], r["mask_frac"],
+                        r["bbox_x"], r["bbox_y"], r["bbox_w"], r["bbox_h"]])
+    with open(os.path.join(sub_root, "ela", "ela.csv"), "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["id", "ela", "image", "ela_qualities", "ela_scale", "is_negative", "type"])
+        for r in rows:
+            w.writerow([r["id"], _bn(r.get("path_ela")), _bn(r["path_img"]),
+                        r.get("ela_qualities", r.get("ela_quality", "")), r.get("ela_scale", ""),
+                        r["is_negative"], r["type"]])
 
 
 # ------------------------------------------------------------------ job spec
@@ -114,27 +191,21 @@ def plan_jobs(cfg: dict, source_paths: list[str], edit_type: str,
     """
     master = np.random.default_rng([int(cfg["orchestrator"]["seed"]), int(type_index)])
     n_docs = int(cfg["orchestrator"]["n_docs"])
-    q2_sweep = cfg["compression"]["q2_sweep"]
-    # Mode Q1 : "native" (Q0 lu, scénario réaliste, défaut) ou "controlled"
-    # (Q1 imposé, échantillonné dans q1_sweep -> alimente les régimes de E5).
-    q1_mode = cfg["compression"].get("q1_mode", "native")
-    q1_sweep = cfg["compression"].get("q1_sweep", [])
-    controlled = (q1_mode == "controlled") and bool(q1_sweep)
-    # Écart minimal |Q1-Q2| : en controlled, on ne stratifie QUE sur les couples
-    # (Q1,Q2) espacés d'au moins ce seuil. Q1==Q2 (écart 0) est dégénéré (double
-    # compression quasi idempotente -> fond ≈ zone), donc exclu par défaut. La
-    # contrainte s'applique AVANT la branche négatif/positif : positifs et négatifs
-    # partagent EXACTEMENT la même loi (Q1,Q2) -> aucune fuite (Q1,Q2)->authenticité.
-    q1q2_gap = int(cfg["compression"].get("q1q2_min_gap", 0))
-    valid_pairs = None
-    if controlled:
-        valid_pairs = [(int(a), int(b)) for a in q1_sweep for b in q2_sweep
-                       if abs(int(a) - int(b)) >= q1q2_gap]
-        if not valid_pairs:
-            raise ValueError(
-                f"Aucun couple (Q1,Q2) avec |Q1-Q2| >= {q1q2_gap} "
-                f"(q1_sweep={list(q1_sweep)}, q2_sweep={list(q2_sweep)}). "
-                "Réduis compression.q1q2_min_gap ou élargis les sweeps.")
+    # DEUX qualités par document : Q2 (sauvegarde FINALE, tirée du sweep, haute) et
+    # Q1 = Q2 - q1_gap (base de compression du "document original", plus basse).
+    # C'est l'ÉCART Q1<Q2 qui rend la substitution détectable : le texte authentique
+    # porte l'historique Q1->Q2, la zone peinte en pixels NEUFS n'a que Q2 -> en ELA
+    # (sondée à une qualité != Q2) elle ressort du texte ordinaire (~2.6x). En Q1==Q2
+    # la falsification serait indiscernable du texte authentique (mesuré : ratio ~1.0).
+    quality_sweep = [int(q) for q in cfg["compression"]["quality_sweep"]]
+    if not quality_sweep:
+        raise ValueError(
+            "compression.quality_sweep est vide : liste au moins une qualité JPEG.")
+    q1_gap = int(cfg["compression"].get("q1_gap", 0))
+    if q1_gap <= 0:
+        raise ValueError(
+            "compression.q1_gap doit être > 0 : sans écart Q1<Q2, la substitution "
+            "est indiscernable du texte authentique en ELA (aucun signal exploitable).")
     neg_ratio = float(cfg["negatives"]["ratio"])
     aligned_ratio = float(cfg["forger"]["aligned_ratio"])
     # size_classes ORDONNÉES du plus petit au plus grand (ordre du config).
@@ -149,15 +220,12 @@ def plan_jobs(cfg: dict, source_paths: list[str], edit_type: str,
         seed = int(master.integers(0, 2**31 - 1))
         jrng = np.random.default_rng(seed)
 
-        # Couple (Q1,Q2) STRATIFIÉ pour une couverture déterministe et équilibrée.
-        # - controlled : on cycle sur les couples valides (|Q1-Q2|>=gap) -> couvre
-        #   Q2<Q1 ET Q2>Q1 (régimes E5), diagonale Q1==Q2 exclue.
-        # - native     : Q1=Q0 (lu par source), Q2 seul stratifié sur le sweep.
-        if controlled:
-            q1, q2 = valid_pairs[i % len(valid_pairs)]
-        else:
-            q1 = None
-            q2 = int(q2_sweep[i % len(q2_sweep)])
+        # Q2 STRATIFIÉE sur le sweep (i % len) -> couverture déterministe et
+        # équilibrée. Q1 = Q2 - gap (borné >= 40 : reste une JPEG valide). Le MÊME
+        # couple (Q1, Q2) est appliqué aux positifs COMME aux négatifs (aucune fuite
+        # qualité globale -> le modèle doit LOCALISER l'écart, pas le lire au niveau page).
+        q2 = int(quality_sweep[i % len(quality_sweep)])
+        q1 = max(40, q2 - q1_gap)
         source_path = str(master.choice(source_paths))
         is_negative = bool(master.random() < neg_ratio)
         # Nommage HONNÊTE : un négatif n'est PAS une falsification du type courant.
@@ -210,12 +278,11 @@ def _run_job(job: Job, cfg: dict, out_dirs: dict, nonstd_thr: float) -> dict:
     q2_sub_str = _SUBSAMPLING_INT2STR.get(DEFAULT_Q2_SUBSAMPLING, "4:2:0")
     ann_cfg = cfg["annotator"]
 
-    # Base de travail : image native (Q0 lu) ou recompressée à Q1 (mode contrôlé).
-    # Q1 devient alors l'historique EFFECTIF du "document original" (fond = Q1->Q2).
-    base_rgb = src.rgb
-    if job.q1 is not None:
-        base_rgb = recompress_to_q1(src.rgb, job.q1, subsampling=DEFAULT_Q2_SUBSAMPLING)
-    q1_effective = job.q1 if job.q1 is not None else src.q0
+    # Base de travail : source TOUJOURS recompressée à q -> établit l'historique
+    # de compression du "document original" (fond double-compressé après la passe
+    # finale à q). Q0 reste lu/journalisé mais n'est plus l'historique effectif.
+    base_rgb = recompress_to_q1(src.rgb, job.q1, subsampling=DEFAULT_Q2_SUBSAMPLING)
+    q1_effective = job.q1
 
     forgery_bboxes: list = []
     if job.is_negative:
@@ -234,9 +301,9 @@ def _run_job(job: Job, cfg: dict, out_dirs: dict, nonstd_thr: float) -> dict:
             if donor.q0 == -1:
                 # Donneur lossless (PNG) : sans ça la région n'aurait AUCUN historique
                 # JPEG et se confondrait avec une substitution. On lui impose une
-                # qualité étrangère Q_donor (tirée dans q1_sweep) -> vraie grille étrangère.
-                q1_sweep = cfg["compression"].get("q1_sweep", [job.q2])
-                donor_q = int(rng.choice(q1_sweep))
+                # qualité étrangère Q_donor (tirée dans quality_sweep) -> vraie grille étrangère.
+                q_choices = [int(q) for q in cfg["compression"].get("quality_sweep", [job.q2])]
+                donor_q = int(rng.choice(q_choices or [job.q2]))
                 donor_rgb = recompress_to_q1(donor_rgb, donor_q, subsampling=DEFAULT_Q2_SUBSAMPLING)
             # (donneur JPEG : historique natif Q0 conservé, déjà étranger au fond.)
         # int (carré) ou [largeur_min, hauteur_min] ; normalisé dans forger.forge().
@@ -269,12 +336,23 @@ def _run_job(job: Job, cfg: dict, out_dirs: dict, nonstd_thr: float) -> dict:
         bbox = ann.bbox_from_mask(mask)            # bbox englobante de l'UNION
 
     # ---- Passe Q2 UNIQUE sur l'image composite entière (règle impérative) ----
-    img_path = os.path.join(out_dirs["data"], f"{job.doc_id}.jpg")
+    #      -> dossier images/
+    img_path = os.path.join(out_dirs["images"], f"{job.doc_id}.jpg")
     save_q2(edited, img_path, job.q2, subsampling=DEFAULT_Q2_SUBSAMPLING)
 
-    # ---- Masque pixel-level exact ----
-    mask_path = os.path.join(out_dirs["data"], f"{job.doc_id}_mask.png")
+    # ---- Masque pixel-level exact -> dossier masks/ ----
+    mask_path = os.path.join(out_dirs["masks"], f"{job.doc_id}_mask.png")
     cv2.imwrite(mask_path, mask)
+
+    # ---- ELA (3 qualités -> RGB) sur le JPEG FINAL re-lu -> dossier ela/ ----
+    ela_cfg = cfg.get("ela_preview", {})
+    ela_center = int(ela_cfg.get("ela_quality", 90))
+    ela_spread = int(ela_cfg.get("ela_spread", 8))
+    ela_qs = ela_qualities(ela_center, ela_spread)
+    ela_scale = float(ela_cfg.get("ela_scale", 15.0))
+    ela_rgb = compute_ela_stack(img_path, ela_qs, ela_scale)
+    ela_path = os.path.join(out_dirs["ela"], f"{job.doc_id}_ela.png")
+    Image.fromarray(ela_rgb, "RGB").save(ela_path)      # RGB : canaux = (q_bas, q_moyen, q_haut)
 
     # ---- Grille patch 24x24 ----
     labels, fracs = ann.patch_grid_labels(
@@ -291,16 +369,21 @@ def _run_job(job: Job, cfg: dict, out_dirs: dict, nonstd_thr: float) -> dict:
         grid=ann_cfg["patch_grid"], overlap_thr=ann_cfg["patch_positive_overlap"],
         q2_subsampling=q2_sub_str,
     )
-    meta["Q1_mode"] = "controlled" if job.q1 is not None else "native"
-    meta["Q1_effective"] = int(q1_effective)   # historique effectif du fond (vs Q2)
+    meta["Q1_mode"] = "history_gap"            # Q1 < Q2 (écart = signal ELA)
+    meta["Q1_effective"] = int(q1_effective)   # = Q1 (historique de compression du fond)
     # Multi-falsification : nb de zones + bbox de CHACUNE (le champ `bbox` est
     # l'englobante de l'union, coarse ; ici la vérité région par région).
     meta["n_forgeries"] = 0 if job.is_negative else int(job.n_forgeries)
     meta["forgery_bboxes"] = forgery_bboxes
     meta["patch_grid"] = labels.tolist()
+    meta["ela"] = {"qualities": ela_qs, "center": ela_center, "spread": ela_spread,
+                   "scale": ela_scale, "channels": "RGB = (q_bas, q_moyen, q_haut)",
+                   "file": os.path.basename(ela_path)}
     meta["files"] = {"image": os.path.basename(img_path),
-                     "mask": os.path.basename(mask_path)}
-    json_path = os.path.join(out_dirs["data"], f"{job.doc_id}.json")
+                     "mask": os.path.basename(mask_path),
+                     "ela": os.path.basename(ela_path)}
+    # Le .json accompagne le masque -> dossier masks/.
+    json_path = os.path.join(out_dirs["masks"], f"{job.doc_id}.json")
     with open(json_path, "w") as f:
         json.dump(meta, f, indent=2)
 
@@ -311,7 +394,7 @@ def _run_job(job: Job, cfg: dict, out_dirs: dict, nonstd_thr: float) -> dict:
         "source_id": src.source_id,
         "q0": src.q0,
         "q0_nonstandard": src.nonstandard,
-        "q1_mode": "controlled" if job.q1 is not None else "native",
+        "q1_mode": "history_gap",
         "q1_effective": int(q1_effective),
         "q2": job.q2,
         "type": edit_type,
@@ -328,9 +411,13 @@ def _run_job(job: Job, cfg: dict, out_dirs: dict, nonstd_thr: float) -> dict:
         "n_pos_patches": int((labels > 0).sum()),
         "subsampling_src": src.subsampling,
         "seed": job.seed,
+        "ela_quality": ela_center,
+        "ela_qualities": ",".join(str(q) for q in ela_qs),
+        "ela_scale": ela_scale,
         "path_img": os.path.relpath(img_path, out_dirs["root"]),
         "path_mask": os.path.relpath(mask_path, out_dirs["root"]),
         "path_json": os.path.relpath(json_path, out_dirs["root"]),
+        "path_ela": os.path.relpath(ela_path, out_dirs["root"]),
     }
 
 
@@ -341,29 +428,6 @@ def _worker(args):
         return _run_job(job, cfg, out_dirs, nonstd_thr)
     except Exception as exc:  # on isole les échecs par document
         return {"id": job.doc_id, "error": f"{type(exc).__name__}: {exc}"}
-
-
-# ------------------------------------------------------------------ auto mode
-def _resolve_q1_mode(cfg: dict, report: dict) -> tuple[str, str]:
-    """Résout `compression.q1_mode`. 'native'/'controlled' -> tels quels.
-
-    'auto' décide d'après le corpus (mesures §README) :
-      - sources lossless (PNG, pas de Q0)                 -> controlled (obligatoire)
-      - JPEG avec Q0 médian >= seuil (défaut 95)          -> controlled (double
-        compression native trop faible : fingerprint quasi nul)
-      - JPEG avec Q0 médian < seuil                       -> native (historique réel)
-    """
-    mode = cfg["compression"].get("q1_mode", "auto")
-    if mode != "auto":
-        return mode, "fixé dans la config"
-    s = report["summary"]
-    if s.get("n_lossless_kept", 0) > 0:
-        return "controlled", "corpus lossless (PNG) : pas de Q0"
-    thr = cfg["compression"].get("q1_auto_q0_threshold", 95)
-    med = s.get("q0_stats", {}).get("median")
-    if med is not None and med >= thr:
-        return "controlled", f"Q0 médian {med} >= {thr} (double compression native faible)"
-    return "native", f"Q0 médian {med} < {thr} (historique JPEG réel exploitable)"
 
 
 # ------------------------------------------------------------------ driver
@@ -392,6 +456,7 @@ def _write_batch(sub_root: str, sub_cfg: dict, report: dict, rows: list) -> tupl
     manifest_path = os.path.join(sub_root, "manifest.parquet")
     if rows:
         pq.write_table(pa.Table.from_pylist(rows), manifest_path)
+        write_folder_csvs(sub_root, rows)     # un CSV par dossier (images/masks/ela)
     report_path = None
     try:
         import reporter
@@ -429,15 +494,28 @@ def run(cfg: dict, limit: Optional[int] = None, workers: Optional[int] = None) -
     print(f"      {len(source_paths)} sources gardées "
           f"(dont {n_lossless} lossless), {report['summary']['n_excluded']} exclues.")
 
-    # Résolution du mode Q1 (auto -> décidé d'après le corpus), figée pour tous les types.
-    resolved_mode, reason = _resolve_q1_mode(cfg, report)
-    cfg = {**cfg, "compression": {**cfg["compression"], "q1_mode": resolved_mode}}
-    print(f"      q1_mode = {resolved_mode}  ({reason})")
-    if n_lossless and resolved_mode != "controlled":
+    # Deux passes Q1<Q2 : source recompressée à Q1 (historique du "document
+    # original"), puis sauvegarde finale à Q2 (haute). Les PNG lossless sont gérés
+    # nativement — l'historique vient entièrement de la passe Q1.
+    sweep = [int(q) for q in cfg["compression"]["quality_sweep"]]
+    gap = int(cfg["compression"].get("q1_gap", 0))
+    ela_q = int(cfg.get("ela_preview", {}).get("ela_quality", 90))
+    q1_vals = sorted({max(40, q - gap) for q in sweep})
+    q1_reco = int(round(float(np.median(q1_vals))))   # sonde optimale ≈ Q1 (point fixe du fond)
+    # GARDE-FOU DUR : si une Q2 du sweep == qualité de sonde ELA, toute l'image est au
+    # point fixe de la sonde et l'ELA s'effondre à 0 (aucune séparabilité).
+    if ela_q in sweep:
         raise ValueError(
-            f"{n_lossless} sources lossless (pas de Q0) mais q1_mode='{resolved_mode}'. "
-            "En native le fond n'est pas double-compressé -> aucun signal. Utilise "
-            "q1_mode: controlled (ou auto).")
+            f"ELA_QUALITY={ela_q} coïncide avec une valeur de QUALITY_SWEEP ({sweep}) : "
+            "l'ELA s'effondrerait à 0 (image au point fixe de la sonde). Choisis "
+            f"ELA_QUALITY ≈ Q1 (recommandé : {q1_reco}).")
+    # ALERTE SOUPLE : la sonde doit viser Q1 (fond au point fixe -> contraste max).
+    # Trop loin de Q1 => signal faible (on l'a mesuré : @90 donne ~1.8 vs @Q1 ~3.2).
+    if abs(ela_q - q1_reco) > 8:
+        print(f"      ⚠️  ELA_QUALITY={ela_q} est loin de Q1≈{q1_reco} "
+              f"(Q1∈{q1_vals}) : contraste ELA sous-optimal. Recommandé : ELA_QUALITY={q1_reco}.")
+    print(f"      compression : Q2 (sweep) = {sweep}, Q1 = Q2-{gap} = {q1_vals}, "
+          f"sonde ELA = {ela_q} (optimum ≈ Q1 = {q1_reco})")
 
     # Snapshot corpus-level à la racine (référence commune).
     with open(os.path.join(out_root, "distribution.json"), "w") as f:
@@ -453,8 +531,12 @@ def run(cfg: dict, limit: Optional[int] = None, workers: Optional[int] = None) -
     results = {}
     for ti, etype in enumerate(edit_types):
         sub_root = os.path.join(out_root, etype)
-        sub_dirs = {"root": sub_root, "data": os.path.join(sub_root, "data")}
-        os.makedirs(sub_dirs["data"], exist_ok=True)
+        sub_dirs = {"root": sub_root,
+                    "images": os.path.join(sub_root, "images"),
+                    "masks": os.path.join(sub_root, "masks"),
+                    "ela": os.path.join(sub_root, "ela")}
+        for _k in ("images", "masks", "ela"):
+            os.makedirs(sub_dirs[_k], exist_ok=True)
         # Config effective du sous-dossier : self-describing (edit_type scalaire).
         sub_cfg = {
             **cfg,

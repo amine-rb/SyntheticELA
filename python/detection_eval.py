@@ -12,9 +12,22 @@ Contenu :
 
 Dépendances : torch, numpy, pillow, scikit-learn, scipy.
 
+Note layout : la génération écrit désormais les images dans `images/`, les masques
+(+ .json) dans `masks/`, et une ELA RGB pré-calculée dans `ela/` (3 qualités empilées
+en canaux, résolution native). Pour l'entraînement : `build_ela_cache(<...>/images, ...)`
+(cache multi-qualité 384) et `SyntheticDevDataset(<...>/masks, cache, ...)` (1er arg =
+dossier des masques).
+
+IMPORTANT — qualités de sonde ELA : viser ≈ Q1 (base du fond = médiane(Q2)−Q1_GAP,
+≈67 avec la config par défaut), PAS 90. Sonder à Q1 met le texte authentique à son
+point fixe (ELA min) et fait exploser la zone falsifiée (mesuré : forgé/auth ~3.2 à
+Q1 vs ~1.8 à Q90). Les 3 qualités E2 encadrent Q1 : (59, 67, 75). Aucune ne doit
+égaler un Q2 du sweep.
+
 Usage (boucle d'entraînement, pilotage §9.3bis) :
 
-    dev_ds  = SyntheticDevDataset("output/data", "cache/dev", qualities=(90,))
+    build_ela_cache("output/images", "cache/dev", qualities=(59, 67, 75))  # ≈ Q1
+    dev_ds  = SyntheticDevDataset("output/masks", "cache/dev", qualities=(67,))
     dev_ds  = pilot_subset(dev_ds, n=400, seed=42)          # sous-échantillon FIXE par époque
     dev_ld  = DataLoader(dev_ds, batch_size=48, num_workers=8, pin_memory=True)
     tracker = BestDetectionTracker("experiments/E0/best_model.pt",
@@ -75,10 +88,11 @@ def _ela_one(args):
     return doc_id
 
 
-def build_ela_cache(data_dir, cache_dir, qualities=(75, 85, 90, 95),
+def build_ela_cache(data_dir, cache_dir, qualities=(59, 67, 75),
                     scale=ELA_SCALE, img_size=384, workers=8):
     """ELA à résolution native -> échelle globale fixe -> resize -> PNG gris.
-    Ne JAMAIS sauver en JPEG. Une passe pour les 4 qualités = E0 + E1 + E2 servis."""
+    Ne JAMAIS sauver en JPEG. Une passe pour les 3 qualités (≈ Q1) = E0/E1 (67) +
+    E2 (59,67,75) servis. Sonder ≈ Q1, pas 90 (cf. en-tête module)."""
     os.makedirs(cache_dir, exist_ok=True)
     jpgs = sorted(glob(os.path.join(data_dir, "*.jpg")))
     jobs = [(p, cache_dir, qualities, scale, img_size) for p in jpgs]
@@ -107,14 +121,16 @@ def _load_ela_stack(cache_dir, doc_id, qualities):
 
 
 class SyntheticDevDataset(Dataset):
-    """Dev synthétique falsifié annoté (output/data) : ELA depuis le cache + masque binaire 384.
+    """Dev synthétique falsifié annoté : ELA depuis le cache + masque binaire 384.
 
-    data_dir  : dossier des doc_XXXXXX.jpg / doc_XXXXXX_mask.png (résolution native)
+    data_dir  : dossier des MASQUES `{doc_id}_mask.png` (= `masks/` de la génération ;
+                résolution native). Les images vivent dans `images/`, servies via le
+                cache ELA (build_ela_cache), pas lues ici.
     cache_dir : dossier des PNG ELA {doc_id}_q{q}.png (384, gris) — cf. build_ela_cache
-    qualities : (90,) pour E0/E1 ; (75, 85, 95) pour E2   <- ordre = config, ne jamais changer
+    qualities : (67,) pour E0/E1 ; (59, 67, 75) pour E2 (≈ Q1) <- ordre = config, ne jamais changer
     """
 
-    def __init__(self, data_dir, cache_dir, qualities=(90,), img_size=384, doc_ids=None):
+    def __init__(self, data_dir, cache_dir, qualities=(67,), img_size=384, doc_ids=None):
         self.cache_dir, self.qualities, self.img_size = cache_dir, tuple(qualities), img_size
         self.data_dir = data_dir
         if doc_ids is None:
@@ -137,7 +153,7 @@ class SyntheticDevDataset(Dataset):
 class AuthenticELADataset(Dataset):
     """Documents authentiques (FPR §9.4, Image AUROC). Masque = zéros par construction."""
 
-    def __init__(self, cache_dir, qualities=(90,), img_size=384, doc_ids=None):
+    def __init__(self, cache_dir, qualities=(67,), img_size=384, doc_ids=None):
         self.cache_dir, self.qualities, self.img_size = cache_dir, tuple(qualities), img_size
         if doc_ids is None:
             q0 = self.qualities[0]

@@ -4,9 +4,8 @@ Rôle
 ----
 Après une génération, produire un `REPORT.md` dans le dossier de sortie qui
 explique **les résultats du run** :
-    - source, config effective, décision de mode Q1,
-    - composition du lot (types / tailles / alignement / négatifs / Q1 / Q2),
-    - couverture des régimes Q1/Q2 (pour l'ablation E5),
+    - source, config effective, qualités (Q1 < Q2, l'écart = signal ELA),
+    - composition du lot (types / tailles / alignement / négatifs / Q),
     - contrôles d'intégrité (masques positifs/négatifs cohérents),
     - séparabilité ELA échantillonnée (le signal falsifié ressort-il ?).
 
@@ -35,10 +34,6 @@ import pyarrow.parquet as pq
 
 
 # ---------------------------------------------------------------- helpers
-def _regime(q1: int, q2: int) -> str:
-    return "Q1<Q2" if q1 < q2 else ("Q1=Q2" if q1 == q2 else "Q1>Q2")
-
-
 def _load(out_root: str):
     manifest = pq.read_table(os.path.join(out_root, "manifest.parquet")).to_pylist()
     dist, cfg = {}, {}
@@ -61,12 +56,25 @@ def _ela_raw(rgb: np.ndarray, quality: int) -> np.ndarray:
     return np.abs(rgb.astype(np.int16) - rec).mean(axis=2)
 
 
-def _ela_separability(out_root, rows, quality=90, sample=60):
-    """Ratio moyen (ELA dans le masque / hors masque) par type × régime.
+def _ink_mask(rgb: np.ndarray) -> np.ndarray:
+    """Masque 'encre' (contenu sombre) via Otsu — pour isoler le TEXTE du papier."""
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    _, binv = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
+    return binv > 0
 
-    Échantillonne au plus `sample` positifs (stratifié par type) pour rester
-    rapide. Ratio > 1 = la zone falsifiée ressort ; < 1 = zone « anormalement
-    propre » (cas substitution à fond plat).
+
+def _ela_separability(out_root, rows, quality=90, sample=60):
+    """Séparabilité ELA par type : zone FALSIFIÉE vs TEXTE AUTHENTIQUE.
+
+    Métrique qui compte pour un détecteur : `forged / authentic_text`, PAS
+    `in_mask / out_mask`. Ce dernier ne mesure que texte-vs-papier blanc (tout
+    texte a une ELA élevée sur ses bords) -> il est élevé même sans aucun signal
+    de compression, donc trompeur. On compare donc l'ELA du texte falsifié à celle
+    du texte AUTHENTIQUE (encre hors masque, dilaté pour exclure le halo de bord).
+    Ratio >1 = la falsification ressort du texte ordinaire (exploitable) ;
+    ≈1 = indiscernable (aucun signal, cas Q1==Q2).
+
+    Renvoie {type: {"fa": [ratios forgé/auth], "fp": [ratios forgé/papier]}}.
     """
     pos = [r for r in rows if not r["is_negative"]]
     if not pos or sample <= 0:
@@ -74,14 +82,14 @@ def _ela_separability(out_root, rows, quality=90, sample=60):
     by_type = defaultdict(list)
     for r in pos:
         by_type[r["type"]].append(r)
-    # Échantillon stratifié par type.
     picked = []
     per = max(1, sample // max(1, len(by_type)))
     for t, lst in by_type.items():
         picked += lst[:per]
     picked = picked[:sample]
 
-    agg = defaultdict(list)
+    kernel = np.ones((9, 9), np.uint8)
+    agg = defaultdict(lambda: {"fa": [], "fp": []})
     for r in picked:
         img_p = os.path.join(out_root, r["path_img"])
         msk_p = os.path.join(out_root, r["path_mask"])
@@ -90,8 +98,16 @@ def _ela_separability(out_root, rows, quality=90, sample=60):
         if not m.any():
             continue
         e = _ela_raw(rgb, quality)
-        ratio = float(e[m].mean() / max(e[~m].mean(), 1e-6))
-        agg[(r["type"], _regime(r["q1_effective"], r["q2"]))].append(ratio)
+        ink = _ink_mask(rgb)
+        forged_dil = cv2.dilate(m.astype(np.uint8), kernel) > 0
+        auth_text = ink & (~forged_dil)       # texte authentique (encre hors falsif.)
+        paper = ~ink                          # papier (référence basse)
+        if not auth_text.any():
+            continue
+        e_forged = float(e[m].mean())
+        agg[r["type"]]["fa"].append(e_forged / max(float(e[auth_text].mean()), 1e-6))
+        if paper.any():
+            agg[r["type"]]["fp"].append(e_forged / max(float(e[paper].mean()), 1e-6))
     return agg, len(picked)
 
 
@@ -105,8 +121,12 @@ def _tbl(header, rows):
 
 
 # ---------------------------------------------------------------- rapport
-def write_report(out_root: str, ela_quality: int = 90, ela_sample: int = 60) -> str:
+def write_report(out_root: str, ela_quality: int | None = None, ela_sample: int = 60) -> str:
     rows, dist, cfg = _load(out_root)
+    # Par défaut, mesurer à la qualité de sonde RÉELLE du run (≈ Q1), pas un 90 figé :
+    # sinon le rapport sous-estime le signal (mesuré ailleurs qu'à l'optimum).
+    if ela_quality is None:
+        ela_quality = int(cfg.get("ela_preview", {}).get("ela_quality", 90)) if cfg else 90
     n = len(rows)
     pos = [r for r in rows if not r["is_negative"]]
     neg = [r for r in rows if r["is_negative"]]
@@ -127,9 +147,9 @@ def write_report(out_root: str, ela_quality: int = 90, ela_sample: int = 60) -> 
         ("Sources gardées", f"{dist.get('n_jpeg_kept', '?')} (dont lossless : {n_lossless})"),
         ("Type de source", src_kind),
         ("Seed global", orch.get("seed", "?")),
-        ("Mode Q1", comp.get("q1_mode", "?")),
-        ("Q1 sweep", comp.get("q1_sweep", "-")),
-        ("Q2 sweep", comp.get("q2_sweep", "-")),
+        ("Q2 finale (sweep)", comp.get("quality_sweep", "-")),
+        ("Écart Q1_GAP", f"Q1 = Q2 - {comp.get('q1_gap', '?')}"),
+        ("Compression", "Q1 < Q2 : fond/texte authentique = Q1->Q2 ; substitution = Q2 seul (l'écart = signal ELA)"),
     ]
     if "q0_stats" in dist:
         s = dist["q0_stats"]
@@ -150,24 +170,10 @@ def write_report(out_root: str, ela_quality: int = 90, ela_sample: int = 60) -> 
     L.append("**Types** : " + ", ".join(f"{k} {v}" for k, v in sorted(Counter(r["type"] for r in rows).items())) + "  ")
     L.append("**Tailles** : " + ", ".join(f"{k} {v}" for k, v in Counter(r["size_class"] for r in rows).items()) + "  ")
     L.append("**Alignement** : " + ", ".join(f"{k} {v}" for k, v in Counter(r["alignment"] for r in rows).items()) + "  ")
-    L.append("**Q2** : " + ", ".join(f"{k}→{v}" for k, v in sorted(Counter(r["q2"] for r in rows).items())) + "  ")
-    L.append("**Q1 effectif** : " + ", ".join(f"{k}→{v}" for k, v in sorted(Counter(r["q1_effective"] for r in rows).items())) + "\n")
+    L.append("**Q2 (sauvegarde finale)** : " + ", ".join(f"{k}→{v}" for k, v in sorted(Counter(r["q2"] for r in rows).items())) + "\n")
 
-    # --- 3. Régimes E5 ---
-    L.append("## 3. Couverture des régimes Q1/Q2 (ablation E5)\n")
-    reg_all = Counter(_regime(r["q1_effective"], r["q2"]) for r in rows)
-    reg_pos = Counter(_regime(r["q1_effective"], r["q2"]) for r in pos)
-    L.append(_tbl(["Régime", "Tous", "Positifs"],
-                  [(k, reg_all.get(k, 0), reg_pos.get(k, 0)) for k in ["Q1<Q2", "Q1=Q2", "Q1>Q2"]]) + "\n")
-    missing = [k for k in ["Q1<Q2", "Q1=Q2", "Q1>Q2"] if reg_pos.get(k, 0) == 0]
-    if missing:
-        L.append(f"> ⚠️ Régimes non peuplés : {', '.join(missing)}. "
-                 "Ajuste `q1_sweep` / `q2_sweep` pour les couvrir.\n")
-    else:
-        L.append("> ✅ Les trois régimes sont peuplés (E5 exploitable).\n")
-
-    # --- 4. Intégrité ---
-    L.append("## 4. Contrôles d'intégrité\n")
+    # --- 3. Intégrité ---
+    L.append("## 3. Contrôles d'intégrité\n")
     bad_pos = sum(r["n_mask_px"] == 0 for r in pos)
     bad_neg = sum(r["n_mask_px"] > 0 for r in neg)
     ok = (bad_pos == 0 and bad_neg == 0)
@@ -182,36 +188,46 @@ def write_report(out_root: str, ela_quality: int = 90, ela_sample: int = 60) -> 
     L.append(_tbl(["Classe", "% page (moy)", "n"],
                   [(sc, f"{np.mean(v):.3f}" if v else "-", len(v)) for sc, v in frac]) + "\n")
 
-    # --- 5. Séparabilité ELA ---
-    L.append("## 5. Signal ELA (séparabilité échantillonnée)\n")
+    # --- 4. Séparabilité ELA ---
+    L.append("## 4. Signal ELA (séparabilité échantillonnée)\n")
     agg, n_used = _ela_separability(out_root, rows, ela_quality, ela_sample)
     if agg:
-        L.append(f"Ratio ELA-Q{ela_quality} moyen **intérieur/extérieur du masque** "
-                 f"(échantillon de {n_used} positifs). >1 = la zone ressort ; "
-                 "<1 = zone « anormalement propre » (substitution à fond plat).\n")
-        types = sorted({k[0] for k in agg}) or ["substitution", "copy_move", "splice"]
-        regimes = ["Q1<Q2", "Q1=Q2", "Q1>Q2"]
+        L.append(f"Ratio ELA-Q{ela_quality} de la zone **falsifiée vs texte "
+                 f"AUTHENTIQUE** (échantillon de {n_used} positifs). C'est la métrique "
+                 "qui compte : >1 = la falsification ressort du texte ordinaire "
+                 "(exploitable) ; ≈1 = indiscernable (aucun signal, ex. Q1==Q2). "
+                 "Le ratio *vs papier* est donné pour info (toujours élevé car tout "
+                 "texte s'allume — trompeur seul).\n")
+        types = sorted(agg) or ["substitution"]
         tbl_rows = []
         for t in types:
-            cells = []
-            for reg in regimes:
-                v = agg.get((t, reg), [])
-                cells.append(f"{np.mean(v):.2f} (n={len(v)})" if v else "–")
-            tbl_rows.append([t] + cells)
-        L.append(_tbl(["type \\ régime"] + regimes, tbl_rows) + "\n")
+            fa, fp = agg[t]["fa"], agg[t]["fp"]
+            fa_s = f"{np.mean(fa):.2f} (n={len(fa)})" if fa else "-"
+            fp_s = f"{np.mean(fp):.2f}" if fp else "-"
+            tbl_rows.append([t, fa_s, fp_s])
+        L.append(_tbl(["type", f"forgé/texte-authentique (ELA-Q{ela_quality})",
+                       "forgé/papier (info)"], tbl_rows) + "\n")
+        best = max((np.mean(agg[t]["fa"]) for t in types if agg[t]["fa"]), default=0.0)
+        if best < 1.3:
+            L.append("> ⚠️ **Signal faible** (forgé/authentique < 1.3) : la falsification "
+                     "est peu distinguable du texte réel. Vérifie que Q1 < Q2 (écart "
+                     "`Q1_GAP`) et que `ELA_QUALITY` diffère des Q2 du sweep.\n")
     else:
         L.append("_(mesure ELA désactivée ou aucun positif)_\n")
 
-    # --- 6. Fichiers ---
-    L.append("## 6. Fichiers produits\n")
+    # --- 5. Fichiers ---
+    L.append("## 5. Fichiers produits\n")
     L.append("```\n"
-             f"{out_root}/data/<id>.jpg          # document falsifié (fond Q1->Q2)\n"
-             f"{out_root}/data/<id>_mask.png     # masque binaire pixel exact\n"
-             f"{out_root}/data/<id>.json         # métadonnées + grille patch 24x24\n"
+             f"{out_root}/images/<id>.jpg        # document falsifié (fond double-compressé à Q)\n"
+             f"{out_root}/images/images.csv      # CSV du dossier (reprise facile)\n"
+             f"{out_root}/masks/<id>_mask.png    # masque binaire pixel exact\n"
+             f"{out_root}/masks/<id>.json        # métadonnées + grille patch 24x24\n"
+             f"{out_root}/masks/masks.csv        # CSV du dossier (bboxes, n_mask_px, ...)\n"
+             f"{out_root}/ela/<id>_ela.png       # ELA RGB (3 qualités ≈ Q1) sur le JPEG final\n"
+             f"{out_root}/ela/ela.csv            # CSV du dossier (qualités/échelle ELA)\n"
              f"{out_root}/manifest.parquet       # table globale\n"
              f"{out_root}/distribution.json      # sonde du corpus source\n"
              f"{out_root}/run_config.yaml        # config effective (reproductibilité)\n"
-             f"{out_root}/ela_preview/           # planches QA (si ela_preview lancé)\n"
              "```\n")
 
     text = "\n".join(L)
@@ -224,7 +240,8 @@ def write_report(out_root: str, ela_quality: int = 90, ela_sample: int = 60) -> 
 def main() -> None:
     ap = argparse.ArgumentParser(description="reporter — REPORT.md d'un lot généré.")
     ap.add_argument("--out", required=True, help="Dossier de sortie du lot (contient manifest.parquet).")
-    ap.add_argument("--ela-quality", type=int, default=90)
+    ap.add_argument("--ela-quality", type=int, default=None,
+                    help="Qualité de sonde ELA pour la séparabilité (défaut : celle du run ≈ Q1).")
     ap.add_argument("--ela-sample", type=int, default=60,
                     help="Nb de positifs échantillonnés pour la séparabilité ELA (0 = désactivé).")
     args = ap.parse_args()

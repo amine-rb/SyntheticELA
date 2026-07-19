@@ -6,16 +6,17 @@ L'orchestrator écrit un sous-dossier autonome par type d'édition
 (`<out>/substitution`, `<out>/copy_move`, `<out>/splice`, ...). Ce module les
 réunit en un seul dataset (`<out>/_aggregated` par défaut) sans rien perdre :
 
-    - copie (ou lie) les fichiers `data/<id>.{jpg,png,json}` de chaque type,
+    - copie (ou lie) les fichiers `images/<id>.jpg`, `masks/<id>_mask.png`,
+      `masks/<id>.json`, `ela/<id>_ela.png` de chaque type,
     - concatène les manifestes en un `manifest.parquet` unique (colonne `type`
-      -> re-filtrable par type à volonté),
+      -> re-filtrable par type à volonté) + un CSV par dossier (images/masks/ela),
     - reprend `distribution.json` (corpus commun) et écrit un `run_config.yaml`
       agrégé + un `REPORT.md` régénéré.
 
 Comme les `doc_id` sont préfixés par le type (`substitution_000000`, ...), les
 noms de fichiers ne collisionnent jamais : l'agrégation est un simple `union`.
-Les chemins du manifeste (`data/<id>.ext`) restent valides tels quels dans le
-dossier agrégé -> aucune réécriture.
+Les chemins du manifeste (`images/<id>.jpg`, ...) restent valides tels quels dans
+le dossier agrégé -> aucune réécriture.
 
 Usage
 -----
@@ -39,7 +40,7 @@ import pyarrow.parquet as pq
 import yaml
 
 
-_PATH_KEYS = ("path_img", "path_mask", "path_json")
+_PATH_KEYS = ("path_img", "path_mask", "path_json", "path_ela")
 
 
 def _place(src: str, dst: str, mode: str) -> None:
@@ -77,7 +78,9 @@ def aggregate(out_root: str, types: list[str] | None = None,
             "(lance d'abord `./scripts/run.sh`).")
 
     dest_root = os.path.join(out_root, dest)
-    os.makedirs(os.path.join(dest_root, "data"), exist_ok=True)
+    # Les dossiers images/ masks/ ela/ sont créés à la volée par `_place`
+    # (chaque chemin relatif du manifeste y pointe déjà).
+    os.makedirs(dest_root, exist_ok=True)
 
     all_rows: list[dict] = []
     used_types, dist_src = [], None
@@ -103,9 +106,14 @@ def aggregate(out_root: str, types: list[str] | None = None,
     if not all_rows:
         raise RuntimeError("Rien à agréger (manifestes vides).")
 
-    # Manifeste concaténé.
+    # Manifeste concaténé + un CSV par dossier (images/masks/ela), comme un lot natif.
     pq.write_table(pa.Table.from_pylist(all_rows),
                    os.path.join(dest_root, "manifest.parquet"))
+    try:
+        from orchestrator import write_folder_csvs
+        write_folder_csvs(dest_root, all_rows)
+    except Exception as exc:
+        print(f"  (CSV par dossier non générés : {type(exc).__name__}: {exc})")
 
     # distribution.json (corpus commun) + run_config agrégé.
     if dist_src:

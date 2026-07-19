@@ -26,29 +26,7 @@ import cv2
 from PIL import Image
 import pyarrow.parquet as pq
 
-from orchestrator import load_config
-
-
-def compute_ela(rgb: np.ndarray, quality: int = 90, scale: float = 15.0) -> np.ndarray:
-    """Carte ELA (uint8, RGB) : différence absolue après un ré-encodage JPEG.
-
-    La qualité ELA doit être DISTINCTE de Q2 (sinon la zone recompressée à Q2 ne
-    ressort pas).
-
-    Lever 3 — ÉCHELLE GLOBALE FIXE (`scale`), identique pour toutes les images, au
-    lieu d'un étirement par le max de chaque image. L'ancien étirement par max
-    laissait le pixel le plus fort (logo, vrai texte) fixer l'échelle et écrasait
-    visuellement les falsifications faibles vers le noir. À échelle globale fixe,
-    l'aperçu reflète ce que « voit » le modèle (cf. `detection_eval.ELA_SCALE`) :
-    aligne `scale` sur cette valeur. La couleur est conservée (par canal) pour
-    révéler les franges chroma (logos/tampons).
-    """
-    buf = io.BytesIO()
-    Image.fromarray(rgb, mode="RGB").save(buf, format="JPEG", quality=int(quality))
-    buf.seek(0)
-    recompressed = np.asarray(Image.open(buf).convert("RGB"), dtype=np.int16)
-    diff = np.abs(rgb.astype(np.int16) - recompressed).astype(np.float32)
-    return np.clip(diff * float(scale), 0, 255).astype(np.uint8)
+from orchestrator import load_config, compute_ela_stack, ela_qualities
 
 
 def _panel(img_bgr, ela_bgr, mask, max_h=700):
@@ -65,8 +43,10 @@ def _panel(img_bgr, ela_bgr, mask, max_h=700):
 
 
 def run(cfg: dict, n_samples: int = 12, ela_quality: int = 90,
-        prefer_positive: bool = True, scale: float = 15.0) -> str:
+        prefer_positive: bool = True, scale: float = 15.0, ela_spread: int = 8) -> str:
     out_root = cfg["paths"]["output_dir"]
+    # MÊME pile ELA 3 qualités -> RGB que la sortie ela/*.png (le modèle voit ça).
+    qs = ela_qualities(int(ela_quality), int(ela_spread))
     manifest_path = os.path.join(out_root, "manifest.parquet")
     if not os.path.exists(manifest_path):
         raise FileNotFoundError(f"Manifeste introuvable : {manifest_path} (lance l'orchestrator d'abord).")
@@ -89,17 +69,17 @@ def run(cfg: dict, n_samples: int = 12, ela_quality: int = 90,
         if mask is None:
             mask = np.zeros(rgb.shape[:2], dtype=np.uint8)
 
-        ela = compute_ela(rgb, ela_quality, scale=scale)
+        ela_rgb = compute_ela_stack(img_path, qs, scale)     # (H,W,3) RGB = 3 qualités
         img_bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-        ela_bgr = cv2.cvtColor(ela, cv2.COLOR_RGB2BGR)
+        ela_bgr = cv2.cvtColor(ela_rgb, cv2.COLOR_RGB2BGR)
         panel = _panel(img_bgr, ela_bgr, mask)
 
         tag = r["type"]
-        out = os.path.join(prev_dir, f"{r['id']}__{tag}__q0-{r['q0']}_q2-{r['q2']}__elaQ{ela_quality}.png")
+        out = os.path.join(prev_dir, f"{r['id']}__{tag}__q0-{r['q0']}_q2-{r['q2']}__elaRGB{qs[0]}-{qs[1]}-{qs[2]}.png")
         cv2.imwrite(out, panel)
 
     print(f"[ela_preview] {len(sample)} planches écrites dans {prev_dir} "
-          f"(ELA Q{ela_quality}, distincte de Q2, échelle globale ×{scale:g}).")
+          f"(ELA RGB 3 qualités {qs}, échelle globale ×{scale:g}).")
     return prev_dir
 
 
@@ -120,7 +100,8 @@ def main() -> None:
     n = args.n if args.n is not None else ela_cfg["n_samples"]
     q = args.ela_quality if args.ela_quality is not None else ela_cfg["ela_quality"]
     s = args.ela_scale if args.ela_scale is not None else ela_cfg.get("ela_scale", 15.0)
-    run(cfg, n_samples=n, ela_quality=q, scale=float(s))
+    spread = int(ela_cfg.get("ela_spread", 8))
+    run(cfg, n_samples=n, ela_quality=q, scale=float(s), ela_spread=spread)
 
 
 if __name__ == "__main__":

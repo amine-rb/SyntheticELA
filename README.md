@@ -64,25 +64,39 @@ Surcharge ponctuelle en CLI, sans éditer `config.sh` :
 ./scripts/preview.sh --out "$OUTPUT_DIR/_aggregated" --n 20
 ```
 
-Sources JPEG **ou** PNG : le mode de compression est choisi automatiquement (§7).
-Chaque run écrit un **`REPORT.md`** qui explique ses résultats (§6).
+Sources JPEG **ou** PNG : deux qualités `Q1 < Q2` par document (base puis save
+final ; l'écart crée le signal ELA, §7). Chaque run écrit un **`REPORT.md`** (§6).
 
 ---
 
 ## 3. Chaîne forensique
 
 ```
-source (Q0 lu si JPEG, sinon lossless)
-   └─[si controlled] recompression unique à Q1   ── fond = historique Q1
-        └─ forger : k falsifications (même type) en espace pixel
-             └─ recompress : UNE SEULE passe JPEG Q2   ← unique compression finale
-                  └─ annotator : masque exact + bbox + grille patch 24×24 + JSON
+source (décodée ; Q0 lu si JPEG, sinon lossless)
+   └─ recompress @Q1         ── "document original" = fond + texte à qualité MOYENNE Q1
+        ├─ POSITIF : forger peint k substitutions (pixels NEUFS, jamais vus par Q1)
+        │       └─ save @Q2   ← fond/texte = Q1→Q2 ; substitution = Q2 seul (Q1<Q2)
+        └─ NÉGATIF : save @Q2 ← tout = Q1→Q2, masque vide
+             └─ annotator : masque exact + bbox + grille patch 24×24 + JSON
 ```
 
-Point clé : la (les) zone(s) éditée(s) subissent **la même passe Q2 que le fond** —
-rien n'est collé après le save final. C'est ce qui crée une vraie **incohérence
-d'historique de compression** entre les zones falsifiées et le reste du document,
-que l'ELA révèle.
+Point clé : **deux qualités `Q1 < Q2`** par document. `Q2` (save final, haute) est
+tiré de `QUALITY_SWEEP` ; `Q1 = Q2 − Q1_GAP` (base, moyenne). **C'est l'écart qui
+crée le signal** : le fond et tout le texte **authentique** portent l'historique
+`Q1→Q2`, tandis que la substitution, peinte en pixels **neufs entre les deux
+passes**, n'a subi que `Q2`. Sondée en ELA (à une qualité **≠ `Q2`**), la zone
+n'ayant vu que `Q2` **ressort du texte ordinaire** (mesuré : *forgé/texte-authentique
+≈ 1,8* à `Q1_GAP=28`). Le négatif subit exactement le même double-passage `Q1→Q2`
+(seule la substitution manque) → ELA propre, **indiscernable du fond d'un positif** :
+aucun indice global, le modèle doit **localiser**.
+
+> ⚠️ **L'écart est impératif.** En `Q1 == Q2`, une substitution est *indiscernable
+> du texte authentique* en ELA (ratio mesuré ≈ 1,0 : tout bord de texte s'allume,
+> quel que soit son historique). Le « 3,5× intérieur/extérieur du masque » qu'on
+> mesurait auparavant ne comparait que *texte vs papier blanc* — trompeur. Deux
+> boutons seulement, pas l'ancienne machinerie de régimes : `QUALITY_SWEEP` (les
+> `Q2`) et `Q1_GAP` (l'écart). Et `ELA_QUALITY` doit différer de tout `Q2` du sweep
+> (sinon l'ELA s'effondre à 0 partout — l'orchestrator le refuse).
 
 Trois types d'édition :
 - **substitution** — écrit une **valeur plausible** (montant, date, quantité, code au
@@ -152,31 +166,45 @@ Chaque type de `EDIT_TYPES` produit un sous-dossier complet et indépendant (il 
 manque aucune info pour l'entraînement/évaluation en aval) :
 
 ```
-<out>/distribution.json          # sonde du corpus source (commune à tous les types)
-<out>/<type>/                     # ex. substitution / copy_move / splice
-     data/<type>_<id>.jpg         # document final (fond Q1->Q2, zones incohérentes)
-     data/<type>_<id>_mask.png    # masque binaire pixel EXACT (union des k zones)
-     data/<type>_<id>.json        # Q0/Q1/Q2, type, taille, alignement, n_forgeries, bboxes, seed, grille 24x24
-     manifest.parquet             # table du sous-dossier (une ligne par document)
-     distribution.json            # sonde du corpus (copie, self-contained)
-     run_config.yaml              # config effective figée
-     REPORT.md                    # rapport lisible des résultats  ← §6
-     ela_preview/                 # planches QA (après ./scripts/preview.sh)
+<out>/distribution.json               # sonde du corpus source (commune à tous les types)
+<out>/<type>/                          # ex. substitution / copy_move / splice
+     images/<type>_<id>.jpg            # document final (fond Q1→Q2 ; zone éditée = Q2 seul)
+     images/images.csv                 # id, image, type, is_negative, quality, size_class, n_forgeries, source_id, seed
+     masks/<type>_<id>_mask.png        # masque binaire pixel EXACT (union des k zones)
+     masks/<type>_<id>.json            # Q0/Q1/Q2, type, taille, alignement, n_forgeries, bboxes, seed, grille 24x24, ela
+     masks/masks.csv                   # id, mask, json, is_negative, n_forgeries, n_mask_px, mask_frac, bbox_*
+     ela/<type>_<id>_ela.png           # ELA RGB (3 qualités ≈ Q1 empilées), résolution native, sur le JPEG final
+     ela/ela.csv                       # id, ela, image, ela_qualities, ela_scale, is_negative, type
+     manifest.parquet                  # table du sous-dossier (une ligne par document)
+     distribution.json                 # sonde du corpus (copie, self-contained)
+     run_config.yaml                   # config effective figée
+     REPORT.md                         # rapport lisible des résultats  ← §6
+     ela_preview/                      # planches QA image|ELA|masque (après ./scripts/preview.sh)
 ```
+
+**Trois dossiers, un CSV chacun** (`images/`, `masks/`, `ela/`) : chaque CSV est
+autonome (une ligne par document, nom de fichier + métadonnées) → on charge un
+dossier sans lire le manifeste Parquet. L'**ELA est une sortie de première classe**,
+calculée à la génération sur le **JPEG final re-lu** (l'artefact réel), à résolution
+native et échelle globale fixe (`ELA_SCALE`, alignée sur `detection_eval.ELA_SCALE`)
+→ un fichier ELA par image, **aligné pixel-à-pixel** avec image et masque. L'ELA est
+produite pour **toutes** les images (positifs ET négatifs : l'ELA du négatif est la
+référence « propre »).
 
 Les négatifs (authentiques, masque vide) portent le marqueur `authentic` dans leur
 nom (`<type>_authentic_<id>`) : jamais de « falsification » à masque vide.
 
 Les `id` sont **préfixés par le type** → uniques globalement. `./scripts/aggregate.sh`
-réunit les sous-dossiers choisis dans `<out>/_aggregated/` (même structure, manifeste
-concaténé, colonne `type` re-filtrable). Options : `--types t1 t2`, `--dest NOM`,
-`--mode copy|symlink|hardlink` (symlink/hardlink = pas de duplication disque).
+réunit les sous-dossiers choisis dans `<out>/_aggregated/` (même structure — `images/`,
+`masks/`, `ela/` + CSV régénérés —, manifeste concaténé, colonne `type` re-filtrable).
+Options : `--types t1 t2`, `--dest NOM`, `--mode copy|symlink|hardlink`
+(symlink/hardlink = pas de duplication disque).
 
 Colonnes du manifeste : `id, source_id, q0, q0_nonstandard, q1_mode, q1_effective,
 q2, type, size_class, alignment, is_negative, n_forgeries, bbox_x/y/w/h, n_mask_px,
-mask_frac, n_pos_patches, subsampling_src, seed, path_img, path_mask, path_json`.
-(`bbox_*` = englobante de l'union ; les bbox individuelles sont dans le JSON,
-champ `forgery_bboxes`.)
+mask_frac, n_pos_patches, subsampling_src, seed, ela_quality, ela_qualities, ela_scale,
+path_img, path_mask, path_json, path_ela`. (`bbox_*` = englobante de l'union ; les bbox
+individuelles sont dans le JSON, champ `forgery_bboxes`.)
 
 ---
 
@@ -185,48 +213,66 @@ champ `forgery_bboxes`.)
 Généré automatiquement à la fin de chaque génération (regénérable seul :
 `python python/reporter.py --out <SOUS-DOSSIER>`). Il contient :
 
-1. **Source & config** (corpus, seed, mode Q1 choisi, sweeps, Q0/dimensions),
-2. **Composition** (types, tailles, alignement, négatifs, Q1, Q2),
-3. **Couverture des régimes Q1/Q2** pour l'ablation robustesse (Q1<Q2 / Q1=Q2 / Q1>Q2),
-4. **Contrôles d'intégrité** (masques positifs/négatifs cohérents, surface par taille),
-5. **Signal ELA échantillonné** : ratio moyen ELA intérieur/extérieur du masque, par
-   type × régime — la mesure « le signal falsifié ressort-il ? ».
+1. **Source & config** (corpus, seed, `QUALITY_SWEEP`, Q0/dimensions),
+2. **Composition** (types, tailles, alignement, négatifs, qualité `Q`),
+3. **Contrôles d'intégrité** (masques positifs/négatifs cohérents, surface par taille),
+4. **Signal ELA échantillonné** : ratio ELA **forgé / texte authentique**, par type —
+   la vraie mesure « la falsification ressort-elle du texte ordinaire ? » (et non
+   texte-vs-papier, qui est toujours élevé et trompeur seul).
 
 ---
 
-## 7. Mode de compression Q1 (auto, adaptatif)
+## 7. Compression : un écart de qualité `Q1 < Q2` par document
 
-`Q1_MODE` (config.sh) :
+Deux boutons seulement : `QUALITY_SWEEP` (les valeurs de `Q2`, save final) et
+`Q1_GAP` (l'écart). Chaque document tire un `Q2` dans le sweep et pose
+`Q1 = Q2 − Q1_GAP` :
 
-| Valeur | Comportement |
-| --- | --- |
-| `native` | garde Q0 (scénario réaliste). Adapté à un corpus JPEG à Q0 varié/modéré. |
-| `controlled` | impose Q1 par recompression → fond réellement double-compressé Q1→Q2. |
-| `auto` *(défaut)* | décide seul et **journalise** : lossless **ou** Q0 médian ≥ `Q1_AUTO_Q0_THRESHOLD` (95) → `controlled` ; sinon `native`. |
+```
+source décodée → recompress @Q1  (le "document original", qualité MOYENNE Q1)
+   → [positif] peindre la substitution (pixels neufs) → save @Q2   (Q1 < Q2)
+   → [négatif]                                          save @Q2
+```
 
-Pourquoi `auto` bascule en `controlled` pour un corpus lossless (PNG) ou quasi sans
-perte (Q0≈100) — **mesuré**, pas supposé (ratio ELA dans/hors masque) :
+- **Fond + texte authentique** : historique `Q1→Q2`. Sondé en ELA **≈ Q1** (leur point
+  fixe) il est **atténué** → **ELA sombre**.
+- **Substitution** : peinte **entre** les deux passes → n'a vu que `Q2`, jamais `Q1` →
+  **ELA vif**, elle **ressort du texte authentique**.
+- **Négatif** : même double-passage `Q1→Q2`, sans substitution → **ELA propre**, fond
+  **identique** à celui d'un positif → pas d'indice global (le modèle localise).
 
-| type | native (Q0≈100) | controlled Q1<Q2 | controlled Q1>Q2 |
-| --- | --- | --- | --- |
-| splice    | 1.41 | **5.68** | 1.91 |
-| copy_move | 1.40 | **1.69** | 1.18 |
+Un corpus PNG (lossless) est géré nativement : l'historique vient **entièrement** de
+la passe `Q1`.
 
-En native sur Q0≈100, le fond n'est quasi pas double-compressé → signal faible. En
-controlled, le fond devient réellement double-compressé et le signal net **et dépendant
-du régime** (Q2<Q1 écrase le signal, limite physique attendue). `Q1_SWEEP ⊆ Q2_SWEEP`
-garantit la couverture des régimes. Q0 reste toujours **lu et journalisé**.
+### Qualité de sonde ELA : viser ≈ Q1 (crucial)
 
-**Écart minimal Q1↔Q2** (`Q1Q2_MIN_GAP`, mode controlled) : quand `Q1 == Q2`, la
-seconde compression est quasi **idempotente** → le fond (Q1→Q2) devient
-indiscernable de la zone falsifiée (simple Q2) : **signal dégénéré**. Le planificateur
-ne tire donc que des couples `(Q1, Q2)` espacés d'au moins `Q1Q2_MIN_GAP` (défaut 15),
-ce qui **exclut la diagonale** `Q1==Q2` tout en couvrant `Q2<Q1` et `Q2>Q1`. La
-contrainte s'applique **identiquement aux positifs et aux négatifs** : sinon `Q1==Q2`
-deviendrait un prédicteur parfait d'authenticité (fuite d'étiquette). `0` = désactivé.
+La sonde ELA (`ELA_QUALITY`) doit viser **≈ Q1** (= médiane(Q2) − `Q1_GAP`), le point
+fixe du fond. C'est ce qui minimise l'ELA du texte authentique et maximise celle de la
+falsification. Mesuré (corpus StaVer, `Q2∈{92,95,97}`, `Q1_GAP=28` → `Q1∈{64,67,69}`),
+**forgé / texte-authentique** selon la sonde :
 
-> Un corpus PNG **doit** utiliser `controlled` (pas de Q0) : le pipeline le force et
-> lève une erreur explicite si on demande `native`.
+| sonde `ELA_QUALITY` | forgé / **texte-authentique** | luminosité zone |
+| --- | --- | --- |
+| 90 (ancien) | 1.8 | ×1 |
+| **67 (≈ Q1, défaut)** | **3.2** | **×2.5** |
+
+L'écart `Q1_GAP` compte aussi (à sonde ≈ Q1) : 22→~2.5, **28→~3.2**, 32→plafonne.
+En `Q1==Q2` : **≈ 1.0** ❌ (indiscernable, aucun signal).
+
+### ELA de sortie = image COULEUR RGB (3 qualités)
+
+`ela/*.png` est une **image RGB** : les 3 canaux sont l'ELA à 3 qualités encadrant `Q1`
+(`ELA_QUALITY ± ELA_SPREAD` = 59/67/75). La couleur vient de la **diversité de qualité**
+(pas de la chroma — mesurée anti-corrélée ici). La zone falsifiée, vive dans les 3 sondes,
+ressort en **blanc/teinté** ; le texte authentique reste sombre. Cela donne **3 canaux
+d'info** au modèle (= mode E2 de `detection_eval`).
+
+> **Deux règles impératives.** (1) `Q1 < Q2` (`Q1_GAP > 0`) — sinon la falsification est
+> indiscernable du texte réel (ratio ≈ 1,0). (2) les 3 qualités ELA ≠ tout `Q2` du sweep
+> — sinon l'ELA **s'effondre à 0** (image au point fixe de la sonde ; l'orchestrator le
+> refuse). L'orchestrator affiche la sonde recommandée (≈ Q1) et alerte si tu t'en
+> éloignes. `copy_move`/`splice` restent générables mais plus faibles (zone déjà porteuse
+> d'un historique JPEG) : ce pipeline vise la substitution.
 
 ---
 
@@ -238,9 +284,9 @@ deviendrait un prédicteur parfait d'authenticité (fuite d'étiquette). `0` = d
 | --- | --- |
 | `SOURCE_DIR`, `OUTPUT_DIR` | corpus source & racine de sortie |
 | `CANDIDATE_EXT`, `ALLOW_LOSSLESS` | extensions acceptées, prise en charge lossless (PNG) |
-| `Q2_SWEEP`, `Q1_MODE`, `Q1_SWEEP`, `Q1_AUTO_Q0_THRESHOLD` | balayage de compression |
-| `Q1Q2_MIN_GAP` | écart min `\|Q1−Q2\|` imposé (controlled) — exclut la diagonale dégénérée `Q1==Q2` (§7) |
-| `EDIT_TYPES` | types générés — **un sous-dossier par type** |
+| `QUALITY_SWEEP` | valeurs de `Q2` (save final, hautes) tirées par document (§7) — **toutes ≠ `ELA_QUALITY`** |
+| `Q1_GAP` | écart de compression : `Q1 = Q2 − Q1_GAP` (§7) — **le bouton du signal**, défaut `28` |
+| `EDIT_TYPES` | types générés — **un sous-dossier par type** (viser `substitution`) |
 | `N_FORGERIES` | `(min max)` falsifications par doc — plafond de taille auto (§4) |
 | `MIN_REGION_PX` | `(largeur hauteur)` taille min garantie de zone (§4) |
 | `PLACE_ON_CONTENT`, `MIN_CONTENT_FRAC` | placer les fraudes sur du contenu réel (§4) |
@@ -248,7 +294,8 @@ deviendrait un prédicteur parfait d'authenticité (fuite d'étiquette). `0` = d
 | `SIZE_SMALL … SIZE_VERY_LARGE` | tailles de zone (fraction de page, min max) |
 | `NEGATIVES_RATIO` | part d'authentiques par sous-dossier (`0.0` = que des fraudes) |
 | `INPUT_RES`, `PATCH_SIZE`, `PATCH_GRID`, `PATCH_POSITIVE_OVERLAP` | grille patch |
-| `ELA_QUALITY`, `ELA_N_SAMPLES`, `ELA_SCALE` | QA visuel (échelle ELA globale fixe) |
+| `ELA_QUALITY`, `ELA_SPREAD` | sonde ELA : centre ≈ Q1 + écart des 3 canaux RGB (§7) |
+| `ELA_N_SAMPLES`, `ELA_SCALE` | nb de planches QA ; échelle ELA globale fixe |
 | `SEED`, `N_DOCS`, `N_WORKERS` | reproductibilité, lot **par type**, parallélisme |
 | `PYTHON` | interpréteur (celui qui a les dépendances) |
 
@@ -261,13 +308,13 @@ Surcharges CLI (sans éditer `config.sh`) : `--src`, `--out`, `--n`, `--workers`
 | Module | Rôle |
 | --- | --- |
 | `jpeg_probe`  | Sonde Q0 / table quant / subsampling / dimensions (ou marque lossless) → `distribution.json`. |
-| `recompress`  | Décode la source ; `recompress_to_q1` (mode contrôlé) ; `save_q2` (passe Q2 unique). |
+| `recompress`  | Décode la source ; `recompress_to_q1` (base @Q) ; `save_q2` (save final @Q, même qualité). |
 | `forger`      | substitution / copy_move / splice ; multi-falsification ; feather anti-tell ; taille min garantie. |
 | `annotator`   | Masque exact, bbox, grille patch 24×24, métadonnées JSON. |
 | `orchestrator`| Batch scriptable, un sous-dossier autonome par type, seeds déterministes, mode Q1 auto, manifeste. |
 | `aggregate`   | Fusionne les sous-dossiers de types en un dataset unique (`_aggregated/`). |
 | `reporter`    | `REPORT.md` (résultats du run + séparabilité ELA). |
-| `ela_preview` | Planches QA image \| ELA \| masque (ELA à une qualité distincte de Q2). |
+| `ela_preview` | Planches QA image \| ELA \| masque (même ELA RGB 3 qualités ≈ Q1 que la sortie). |
 | `main`        | Point d'entrée appelé par `run.sh`. |
 | `detection_eval` | Évaluation détection/localisation AnoViT (§11) — à copier dans le codebase d'entraînement. |
 
@@ -289,13 +336,16 @@ Module autonome à **copier dans le codebase d'entraînement** d'AnoViT. Implém
 protocole du mémoire (voir `markdown/plan.md` §9.3 seuil, §9.3bis pilotage, §9.4
 métriques). Dépendances supplémentaires : `torch, scikit-learn, scipy`.
 
-**Cache ELA (une fois, hors entraînement).** ELA à résolution native → échelle globale
-fixe → resize 384 → PNG gris (jamais JPEG). Une passe sert E0/E1 (1 qualité) et E2 (3) :
+**Cache ELA (une fois, hors entraînement).** Le dossier `ela/` généré contient l'ELA
+RGB (3 qualités ≈ Q1) à résolution native ; l'entraînement construit son propre cache
+**384** via `build_ela_cache`, recalculé depuis les **images** (`images/`) : ELA
+résolution native → échelle globale fixe → resize 384 → PNG gris (jamais JPEG). **Viser
+≈ Q1** (≈ 67 par défaut), PAS 90. Une passe sert E0/E1 (1 qualité, 67) et E2 (3, encadrant Q1) :
 
 ```python
 from detection_eval import build_ela_cache
-build_ela_cache("<out>/_aggregated/data", "cache/dev",  qualities=(75, 85, 90, 95))
-build_ela_cache("chemin/authentiques",    "cache/auth", qualities=(75, 85, 90, 95))
+build_ela_cache("<out>/_aggregated/images", "cache/dev",  qualities=(59, 67, 75))  # ≈ Q1
+build_ela_cache("chemin/authentiques",      "cache/auth", qualities=(59, 67, 75))
 ```
 
 **Loaders + pilotage best-detection (§9.3bis).**
@@ -305,7 +355,7 @@ from torch.utils.data import DataLoader
 from detection_eval import (SyntheticDevDataset, AuthenticELADataset,
                             pilot_subset, evaluate, BestDetectionTracker)
 
-dev_ds  = SyntheticDevDataset("<out>/_aggregated/data", "cache/dev", qualities=(90,))
+dev_ds  = SyntheticDevDataset("<out>/_aggregated/masks", "cache/dev", qualities=(67,))  # ≈Q1 ; 1er arg = dossier masks/
 dev_ld  = DataLoader(pilot_subset(dev_ds, 400, seed=42), batch_size=48, num_workers=8)
 tracker = BestDetectionTracker("experiments/E0/best_model.pt",
                                history_path="experiments/E0/auprc_curve.json", patience=15)

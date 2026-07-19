@@ -36,11 +36,8 @@ gen_config() {
         echo "  nonstandard_absdiff_threshold: ${NONSTANDARD_ABSDIFF_THRESHOLD}"
 
         echo "compression:"
-        echo "  q2_sweep: [$(IFS=', '; echo "${Q2_SWEEP[*]}")]"
-        echo "  q1_mode: ${Q1_MODE}"
-        echo "  q1_auto_q0_threshold: ${Q1_AUTO_Q0_THRESHOLD}"
-        echo "  q1_sweep: [$(IFS=', '; echo "${Q1_SWEEP[*]}")]"
-        echo "  q1q2_min_gap: ${Q1Q2_MIN_GAP}"
+        echo "  quality_sweep: [$(IFS=', '; echo "${QUALITY_SWEEP[*]}")]"
+        echo "  q1_gap: ${Q1_GAP}"
 
         echo "forger:"
         echo "  edit_types:"
@@ -71,6 +68,7 @@ gen_config() {
 
         echo "ela_preview:"
         echo "  ela_quality: ${ELA_QUALITY}"
+        echo "  ela_spread: ${ELA_SPREAD}"
         echo "  n_samples: ${ELA_N_SAMPLES}"
         echo "  ela_scale: ${ELA_SCALE}"
 
