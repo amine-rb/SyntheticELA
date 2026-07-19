@@ -12,10 +12,10 @@
 # =============================================================================
 
 # --- Chemins -----------------------------------------------------------------
-SOURCE_DIR="/Users/amine_rb/Desktop/Master IASD/coding/SyntheticEla/StaVer/scans/scans"   # dossier des images sources
-OUTPUT_DIR="/Users/amine_rb/Desktop/Master IASD/coding/SyntheticEla/StaVer/scans/fraud"   # dossier des images sources
-# SOURCE_DIR="/Users/amine_rb/Desktop/Master IASD/coding/SyntheticEla/SROIE2019/train/img"   # dossier des images sources
-# OUTPUT_DIR="/Users/amine_rb/Desktop/Master IASD/coding/SyntheticEla/SROIE2019/train/fraud"    # racine des sorties
+# SOURCE_DIR="/Users/amine_rb/Desktop/Master IASD/coding/SyntheticEla/StaVer/scans/scans"   # dossier des images sources
+# OUTPUT_DIR="/Users/amine_rb/Desktop/Master IASD/coding/SyntheticEla/StaVer/scans/fraud"   # dossier des images sources
+SOURCE_DIR="/Users/amine_rb/Desktop/Master IASD/coding/SyntheticEla/SROIE2019/train/img"   # dossier des images sources
+OUTPUT_DIR="/Users/amine_rb/Desktop/Master IASD/coding/SyntheticEla/SROIE2019/train/fraud"    # racine des sorties
 
 # --- Sonde du corpus ---------------------------------------------------------
 PROBE_RECURSIVE=true                         # parcourt les sous-dossiers
@@ -105,6 +105,18 @@ ELA_N_SAMPLES=50                             # nb de planches image | ELA | masq
 # Échelle GLOBALE FIXE de l'ELA d'aperçu (pas d'étirement par max d'image, qui
 # écrasait les fraudes faibles). Aligne-la sur detection_eval.ELA_SCALE (=15).
 ELA_SCALE=15
+# --- Réduction des FAUX POSITIFS colorés (logos/tampons/cachets) --------------
+# Deux leviers CUMULABLES. La substitution est du texte NOIR ; le mobilier
+# authentique coloré brille autant en ELA -> faux positifs. Valides tant que la
+# fraude est achromatique (substitution) ; à désactiver si on falsifie du coloré.
+#
+# 1) Gris AVANT l'ELA : effondre l'ELA du mobilier coloré CLAIR (mesuré 74 -> ~8),
+#    la fraude garde ~99 %. Ne suffit pas seul sur le coloré FONCÉ. true/false.
+ELA_GRAYSCALE_INPUT=true
+# 2) Suppression chroma APRÈS l'ELA : efface les pixels colorés quelle que soit leur
+#    luminosité (chroma > seuil -> 0), donc rattrape le coloré foncé. Seuil ~20 :
+#    logo/tampon -> 0, fraude garde ~87 %. 0 = désactivé.
+ELA_CHROMA_SUPPRESS=20
 
 # --- Orchestration -----------------------------------------------------------
 SEED=42                                      # seed global (reproductibilité)

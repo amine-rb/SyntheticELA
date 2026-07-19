@@ -53,7 +53,8 @@ def _iter_images(src: str, recursive: bool):
 
 
 def run(src_dir: str, out_dir: str, ela_quality: int, ela_spread: int,
-        scale: float, recursive: bool = False) -> str:
+        scale: float, recursive: bool = False, chroma_suppress: float = 0.0,
+        grayscale_input: bool = False) -> str:
     if not os.path.isdir(src_dir):
         raise NotADirectoryError(f"Dossier source introuvable : {src_dir}")
     qs = ela_qualities(int(ela_quality), int(ela_spread))   # MÊME pile que la sortie du pipeline
@@ -65,7 +66,9 @@ def run(src_dir: str, out_dir: str, ela_quality: int, ela_spread: int,
         stem = os.path.splitext(os.path.basename(img_path))[0]
         ela_name = f"{stem}_ela.png"
         try:
-            ela_rgb = compute_ela_stack(img_path, qs, scale)   # (H,W,3) RGB
+            ela_rgb = compute_ela_stack(img_path, qs, scale,
+                                        chroma_suppress=chroma_suppress,
+                                        grayscale_input=grayscale_input)   # (H,W,3) RGB
         except Exception as e:                                  # image illisible -> on saute, on signale
             print(f"[ela_scan] ⚠️  ignorée ({e}) : {img_path}")
             continue
@@ -85,8 +88,10 @@ def run(src_dir: str, out_dir: str, ela_quality: int, ela_spread: int,
         w.writeheader()
         w.writerows(rows)
 
+    cs = f", chroma_suppress={chroma_suppress:g}" if chroma_suppress else ""
+    gs = ", grayscale_input" if grayscale_input else ""
     print(f"[ela_scan] {n} ELA RGB écrites dans {out_dir} "
-          f"(qualités {qs}, échelle globale ×{scale:g}).")
+          f"(qualités {qs}, échelle globale ×{scale:g}{gs}{cs}).")
     if n == 0:
         print(f"[ela_scan] ⚠️  aucune image {IMG_EXT} trouvée sous {src_dir}"
               f"{' (essayez --recursive)' if not recursive else ''}.")
@@ -107,6 +112,13 @@ def main() -> None:
                     help="Écart des 3 canaux (défaut = config ela.ela_spread).")
     ap.add_argument("--ela-scale", type=float, default=None,
                     help="Échelle globale fixe (défaut = config ela.ela_scale=15).")
+    ap.add_argument("--chroma-suppress", type=float, default=None,
+                    help="Atténue l'ELA des pixels colorés (logos/tampons) ; 0 = off "
+                         "(défaut = config ela.chroma_suppress).")
+    ap.add_argument("--grayscale-input", dest="grayscale_input", action="store_true", default=None,
+                    help="Passe l'image en gris AVANT l'ELA (défaut = config ela.grayscale_input).")
+    ap.add_argument("--no-grayscale-input", dest="grayscale_input", action="store_false",
+                    help="Force l'ELA sur l'image couleur (désactive ela.grayscale_input).")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
@@ -114,8 +126,10 @@ def main() -> None:
     q = args.ela_quality if args.ela_quality is not None else int(ela_cfg["ela_quality"])
     spread = args.ela_spread if args.ela_spread is not None else int(ela_cfg.get("ela_spread", 8))
     scale = args.ela_scale if args.ela_scale is not None else float(ela_cfg.get("ela_scale", 15.0))
+    chroma = args.chroma_suppress if args.chroma_suppress is not None else float(ela_cfg.get("chroma_suppress", 0.0))
+    gray = args.grayscale_input if args.grayscale_input is not None else bool(ela_cfg.get("grayscale_input", False))
     run(args.src, args.out, ela_quality=q, ela_spread=spread,
-        scale=scale, recursive=args.recursive)
+        scale=scale, recursive=args.recursive, chroma_suppress=chroma, grayscale_input=gray)
 
 
 if __name__ == "__main__":

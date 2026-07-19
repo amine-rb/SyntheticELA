@@ -74,24 +74,51 @@ def ela_qualities(center: int, spread: int) -> list[int]:
     return [int(np.clip(center + d, 40, 99)) for d in (-spread, 0, spread)]
 
 
-def compute_ela_stack(img_path: str, qualities: list[int], scale: float) -> np.ndarray:
+def compute_ela_stack(img_path: str, qualities: list[int], scale: float,
+                      chroma_suppress: float = 0.0,
+                      grayscale_input: bool = False) -> np.ndarray:
     """Pile ELA 3 qualités -> (H, W, 3) uint8 RGB, sur le JPEG FINAL re-lu.
 
     Canal k = |image - recompress(image, qualities[k])| moyennée sur canaux, à
     échelle GLOBALE fixe (`scale`), résolution NATIVE (aligné pixel avec image/masque).
     L'ordre des canaux (R,G,B) = (q_bas, q_moyen, q_haut). Encodeur PIL (cohérent
-    avec `ela_scan` / `detection_eval`).
+    avec `ela_scan` / `detection_eval`). La "couleur" RGB vient de la DIVERSITÉ de
+    qualité (3 sondes), pas de la couleur de l'image -> compatible avec l'entrée gris.
+
+    Deux réducteurs de FAUX POSITIFS colorés (logos/tampons/cachets), cumulables :
+    - `grayscale_input` : passe l'image en GRIS AVANT l'ELA. Un logo coloré a des
+      bords énormes PAR CANAL (le canal opposé passe 0<->255) ; en gris ces
+      contrastes se moyennent en une luminance douce -> l'ELA du mobilier coloré
+      CLAIR s'effondre (mesuré 74 -> ~8), la fraude (texte noir) garde ~99 %.
+      Ne suffit pas seul sur le mobilier coloré FONCÉ (reste sombre = contrasté).
+    - `chroma_suppress` > 0 : atténue l'ELA des pixels colorés via un poids
+      w = clip(1 - chroma/seuil, 0, 1) (chroma = distance (Cb,Cr) au gris, mesurée
+      sur l'ORIGINAL couleur même si l'ELA est en gris). Efface le mobilier coloré
+      QUELLE QUE SOIT sa luminosité (chroma > seuil -> w=0). 0 = désactivé.
+    Les deux valides POUR LA SUBSTITUTION (fraude achromatique) ; à désactiver si
+    l'on falsifie une zone colorée.
     """
-    rgb = np.asarray(Image.open(img_path).convert("RGB"), dtype=np.int16)
+    orig = np.asarray(Image.open(img_path).convert("RGB"), dtype=np.uint8)  # gardé pour la chroma
+    if grayscale_input:
+        g = cv2.cvtColor(orig, cv2.COLOR_RGB2GRAY)
+        img = cv2.cvtColor(g, cv2.COLOR_GRAY2RGB).astype(np.int16)          # 3 canaux gris identiques
+    else:
+        img = orig.astype(np.int16)
     chans = []
     for q in qualities:
         buf = io.BytesIO()
-        Image.fromarray(rgb.astype(np.uint8), "RGB").save(buf, "JPEG", quality=int(q))
+        Image.fromarray(img.astype(np.uint8), "RGB").save(buf, "JPEG", quality=int(q))
         buf.seek(0)
         rec = np.asarray(Image.open(buf).convert("RGB"), dtype=np.int16)
-        diff = np.abs(rgb - rec).mean(axis=2)          # ELA luminance à cette qualité
-        chans.append(np.clip(diff * float(scale), 0, 255).astype(np.uint8))
-    return np.stack(chans, axis=2)                      # (H, W, 3) RGB
+        diff = np.abs(img - rec).mean(axis=2)          # ELA luminance à cette qualité
+        chans.append(diff)
+    ela = np.stack(chans, axis=2).astype(np.float32) * float(scale)
+    if chroma_suppress and chroma_suppress > 0:
+        ycc = cv2.cvtColor(orig, cv2.COLOR_RGB2YCrCb).astype(np.float32)    # chroma sur l'ORIGINAL
+        chroma = np.sqrt((ycc[..., 1] - 128.0) ** 2 + (ycc[..., 2] - 128.0) ** 2)
+        w = np.clip(1.0 - chroma / float(chroma_suppress), 0.0, 1.0)        # 1=achroma garde, 0=coloré efface
+        ela *= w[..., None]
+    return np.clip(ela, 0, 255).astype(np.uint8)        # (H, W, 3) RGB
 
 
 def _bn(rel: Optional[str]) -> str:
@@ -350,7 +377,10 @@ def _run_job(job: Job, cfg: dict, out_dirs: dict, nonstd_thr: float) -> dict:
     ela_spread = int(ela_cfg.get("ela_spread", 8))
     ela_qs = ela_qualities(ela_center, ela_spread)
     ela_scale = float(ela_cfg.get("ela_scale", 15.0))
-    ela_rgb = compute_ela_stack(img_path, ela_qs, ela_scale)
+    ela_chroma = float(ela_cfg.get("chroma_suppress", 0.0))
+    ela_gray = bool(ela_cfg.get("grayscale_input", False))
+    ela_rgb = compute_ela_stack(img_path, ela_qs, ela_scale,
+                                chroma_suppress=ela_chroma, grayscale_input=ela_gray)
     ela_path = os.path.join(out_dirs["ela"], f"{job.doc_id}_ela.png")
     Image.fromarray(ela_rgb, "RGB").save(ela_path)      # RGB : canaux = (q_bas, q_moyen, q_haut)
 
@@ -377,7 +407,9 @@ def _run_job(job: Job, cfg: dict, out_dirs: dict, nonstd_thr: float) -> dict:
     meta["forgery_bboxes"] = forgery_bboxes
     meta["patch_grid"] = labels.tolist()
     meta["ela"] = {"qualities": ela_qs, "center": ela_center, "spread": ela_spread,
-                   "scale": ela_scale, "channels": "RGB = (q_bas, q_moyen, q_haut)",
+                   "scale": ela_scale, "chroma_suppress": ela_chroma,
+                   "grayscale_input": ela_gray,
+                   "channels": "RGB = (q_bas, q_moyen, q_haut)",
                    "file": os.path.basename(ela_path)}
     meta["files"] = {"image": os.path.basename(img_path),
                      "mask": os.path.basename(mask_path),

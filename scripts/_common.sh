@@ -71,6 +71,8 @@ gen_config() {
         echo "  ela_spread: ${ELA_SPREAD}"
         echo "  n_samples: ${ELA_N_SAMPLES}"
         echo "  ela_scale: ${ELA_SCALE}"
+        echo "  chroma_suppress: ${ELA_CHROMA_SUPPRESS}"
+        echo "  grayscale_input: ${ELA_GRAYSCALE_INPUT}"
 
         echo "orchestrator:"
         echo "  seed: ${SEED}"

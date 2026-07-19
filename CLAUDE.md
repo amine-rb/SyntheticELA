@@ -93,6 +93,23 @@ chroma (chroma ELA was measured anti-correlated here — it lights up authentic 
 The forgery is bright in all three → white/tinted; authentic text stays dark. This gives the model 3
 channels of real information (= `detection_eval`'s E2 mode).
 
+**Coloured-false-positive suppression (two cumulative knobs in `compute_ela_stack`)**: authentic
+coloured furniture (logos, stamps, cachets) lights up in ELA as bright as a forgery (measured ELA ≈74
+vs 82) — the dominant false positive. A **substitution is achromatic** (black text, chroma ≈3) while
+logos/stamps are coloured (chroma ≈40), so colour is the discriminator, used **in the negative**:
+- `ELA_GRAYSCALE_INPUT` (true/false): grayscale the image **before** ELA. A coloured logo has huge
+  *per-channel* edges (opposite channel swings 0↔255); grayscaling averages them into a soft luminance,
+  so **light** coloured furniture's ELA collapses (74→~8–23) while the black-text forgery keeps ~99%.
+  The RGB output survives (its 3 channels come from the 3 *qualities*, not the image colour).
+- `ELA_CHROMA_SUPPRESS` (default 20, 0=off): multiplies the ELA by `w = clip(1 − chroma/thr, 0, 1)`,
+  chroma measured on the **original colour** image even when the ELA is grayscale, so it erases coloured
+  pixels **regardless of luminance** (catches the **dark** coloured furniture grayscale leaves behind).
+
+Grayscale alone doesn't kill dark coloured furniture; chroma alone works but keeps less forgery signal —
+cumulated (gray→chroma): logo/stamp→0, forgery ~86%, forged/authentic-text 1.79→1.93. This is chroma's
+useful role — a **filter, not an ELA channel** (as a channel it's anti-correlated). Both valid **only
+while the forgery is achromatic** (substitution); disable if forging coloured regions.
+
 Invariants that create the signal: (1) `Q1 < Q2` (the gap), enforced by `Q1_GAP > 0`; (2) the three
 ELA probe qualities `∉ QUALITY_SWEEP` — if a probe equals a `Q2`, the whole image sits at that fixed
 point and ELA collapses to ~0 (orchestrator raises on the center; keep the spread clear of `Q2` too);
