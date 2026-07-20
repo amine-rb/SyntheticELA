@@ -45,12 +45,14 @@ Dépendances : NumPy + OpenCV.
 
 from __future__ import annotations
 
-import string
+import colorsys
 from dataclasses import dataclass, field
 from typing import Optional, Union
 
 import cv2
 import numpy as np
+
+import lexicon
 
 
 # ------------------------------------------------------------------ constantes
@@ -75,10 +77,9 @@ _INK_TARGET_LUM = 55.0
 #     renforcement possible, comme un montant total mis en avant).
 #   _LINE_H_FRAC : REPLI seulement, si la page a trop peu de texte pour une mesure
 #     fiable (calé ~0.6–1.1% de page, ordre de grandeur d'un corps de facture).
-#   _SIZE_NCHARS : longueur de la valeur plausible selon la classe de taille.
+# (Le corpus de valeurs injectées et les longueurs par classe vivent dans lexicon.py.)
 _LINE_H_FRAC = (0.006, 0.011)
 _SUBST_EMPHASIS = (0.9, 1.3)
-_SIZE_NCHARS = {"small": (2, 6), "medium": (4, 9), "large": (6, 13), "very_large": (9, 18)}
 
 
 @dataclass
@@ -333,31 +334,30 @@ def _hard_mask(img_h, img_w, y, x, h, w) -> np.ndarray:
 
 # ---------------------------------------------------------------- éditions
 def _plausible_token(rng, size_class) -> str:
-    """Valeur PLAUSIBLE au format document (montant, date, entier, code), dont la
-    longueur dépend de la classe de taille. Remplace le charabia aléatoire :
-    la falsification ressemble à une vraie valeur éditée (montant/date/quantité)."""
-    lo, hi = _SIZE_NCHARS.get(size_class, (3, 8))
-    target = int(rng.integers(lo, hi + 1))
-    kind = str(rng.choice(["amount", "amount", "amount", "date", "int", "code"]))
-    if kind == "amount":
-        digits = max(1, min(6, target - 3))
-        whole = int(rng.integers(1, 10 ** digits))
-        s = f"{whole:,}".replace(",", ".")               # séparateur milliers style EU
-        return f"{s},{int(rng.integers(0, 100)):02d} €"
-    if kind == "date":
-        return (f"{int(rng.integers(1, 29)):02d}.{int(rng.integers(1, 13)):02d}."
-                f"{int(rng.integers(1995, 2025))}")
-    if kind == "int":
-        d = max(1, min(6, target))
-        return str(int(rng.integers(10 ** (d - 1), 10 ** d)))
-    letters = "".join(str(rng.choice(list(string.ascii_uppercase)))
-                      for _ in range(max(2, target // 3)))
-    return f"{letters}-{int(rng.integers(100, 9999))}"
+    """Valeur PLAUSIBLE écrite par la substitution, tirée d'un GROS corpus varié
+    (FR/EN/date/chiffres/code/caractere/phrase) — voir `lexicon.py`. La diversité de
+    contenu empêche le modèle d'apprendre le TEXTE comme raccourci et le force à
+    s'appuyer sur le signal de compression ELA. Sortie garantie ASCII (aucun '???' :
+    cv2.putText/Hershey ne rend que l'ASCII ; le lexique translittère é->e, etc.)."""
+    return lexicon.plausible_token(rng, size_class)
+
+
+def _random_ink_color(rng) -> np.ndarray:
+    """Couleur d'encre SATURÉE tirée au hasard (RGB float64, ordre du pipeline).
+    Teinte uniforme sur le cercle, saturation forte, valeur moyenne -> encre/tampon
+    plausible (bleu, rouge, vert, violet…) et VISIBLE sur papier clair. La teinte
+    change à chaque appel -> diversité de couleurs des fraudes."""
+    hue = float(rng.random())
+    sat = float(rng.uniform(0.55, 1.0))
+    val = float(rng.uniform(0.40, 0.80))
+    r, g, b = colorsys.hsv_to_rgb(hue, sat, val)
+    return np.array([r * 255.0, g * 255.0, b * 255.0], dtype=np.float64)
 
 
 def _forge_substitution(rng, img, size_class, area_range, feather,
                         min_w_px: int, min_h_px: int, forbid=None,
-                        content=None, min_content_frac=0.0) -> ForgeResult:
+                        content=None, min_content_frac=0.0,
+                        color_prob=0.0) -> ForgeResult:
     """Écrit une VALEUR PLAUSIBLE à la taille du texte du document.
 
     Réalisme (isole le signal de compression, évite le « tell » du générateur) :
@@ -416,6 +416,18 @@ def _forge_substitution(rng, img, size_class, area_range, feather,
     if bg_lum > 100.0 and (bg_lum - ink_lum) < _MIN_INK_CONTRAST:
         ink = np.clip(bg * (_INK_TARGET_LUM / max(bg_lum, 1e-6)), 0, 255)
 
+    # Encre EN COULEUR (probabilité color_prob) : couleur saturée tirée au hasard,
+    # DIFFÉRENTE à chaque substitution, pour que le modèle apprenne la fraude quelle
+    # que soit sa teinte (pas seulement le texte noir). On garde un contraste de
+    # luminance minimal avec le fond (vrais bords -> vrai signal de compression).
+    ink_colored = bool(color_prob) and (float(rng.random()) < float(color_prob))
+    if ink_colored:
+        ink = _random_ink_color(rng)
+        ink_lum = float(ink.mean())
+        if bg_lum > 100.0 and (bg_lum - ink_lum) < _MIN_INK_CONTRAST:
+            ink = np.clip(ink * (max(0.0, bg_lum - _MIN_INK_CONTRAST) / max(ink_lum, 1e-6)),
+                          0, 255)
+
     patch = np.empty((h, w, 3), dtype=np.uint8)
     patch[:] = bg.astype(np.uint8)
     org = (pad, pad + th)                       # origine putText (bas-gauche)
@@ -428,7 +440,9 @@ def _forge_substitution(rng, img, size_class, area_range, feather,
     return ForgeResult(
         image=edited, mask=mask, edit_type="substitution", size_class=size_class,
         alignment="N/A", bbox=[x, y, w, h], area_frac=round(frac, 6),
-        feather_radius=round(feather, 3), extra={"text": token},
+        feather_radius=round(feather, 3),
+        extra={"text": token, "ink_colored": ink_colored,
+               "ink_rgb": [int(round(c)) for c in ink]},
     )
 
 
@@ -509,6 +523,7 @@ def forge(
     forbid: Optional[list] = None,
     on_content: bool = False,
     min_content_frac: float = 0.0,
+    color_prob: float = 0.0,
 ) -> ForgeResult:
     """Point d'entrée : applique UNE falsification et renvoie image+masque+méta.
 
@@ -533,7 +548,8 @@ def forge(
     if edit_type == "substitution":
         result = _forge_substitution(rng, img, size_class, area_range, feather,
                                      min_w_px, min_h_px, forbid,
-                                     content=content, min_content_frac=mcf)
+                                     content=content, min_content_frac=mcf,
+                                     color_prob=color_prob)
     elif edit_type == "copy_move":
         result = _forge_copy_move(rng, img, size_class, area_range, alignment, feather,
                                   min_w_px, min_h_px, forbid,

@@ -37,7 +37,13 @@ gen_config() {
 
         echo "compression:"
         echo "  quality_sweep: [$(IFS=', '; echo "${QUALITY_SWEEP[*]}")]"
-        echo "  q1_gap: ${Q1_GAP}"
+        # Q1_GAP peut être un scalaire (Q1 fixe) OU un tableau (min max) -> Q1 varie
+        # par doc (option A). On rend toujours une liste [min, max] côté YAML.
+        if [[ ${#Q1_GAP[@]} -gt 1 ]]; then
+            echo "  q1_gap: [${Q1_GAP[0]}, ${Q1_GAP[1]}]"
+        else
+            echo "  q1_gap: ${Q1_GAP[0]}"
+        fi
 
         echo "forger:"
         echo "  edit_types:"
@@ -49,6 +55,7 @@ gen_config() {
         echo "  n_forgeries: [${N_FORGERIES[0]}, ${N_FORGERIES[1]}]"
         echo "  place_on_content: ${PLACE_ON_CONTENT}"
         echo "  min_content_frac: ${MIN_CONTENT_FRAC}"
+        echo "  subst_color_prob: ${SUBST_COLOR_PROB:-0.0}"
 
         echo "size_classes:"
         echo "  small:      [${SIZE_SMALL[0]}, ${SIZE_SMALL[1]}]"

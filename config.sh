@@ -14,8 +14,12 @@
 # --- Chemins -----------------------------------------------------------------
 # SOURCE_DIR="/Users/amine_rb/Desktop/Master IASD/coding/SyntheticEla/StaVer/scans/scans"   # dossier des images sources
 # OUTPUT_DIR="/Users/amine_rb/Desktop/Master IASD/coding/SyntheticEla/StaVer/scans/fraud"   # dossier des images sources
-SOURCE_DIR="/Users/amine_rb/Desktop/Master IASD/coding/SyntheticEla/SROIE2019/train/img"   # dossier des images sources
-OUTPUT_DIR="/Users/amine_rb/Desktop/Master IASD/coding/SyntheticEla/SROIE2019/train/fraud"    # racine des sorties
+# SOURCE_DIR="/Users/amine_rb/Desktop/Master IASD/coding/SyntheticEla/SROIE2019/train/img"   # dossier des images sources
+# OUTPUT_DIR="/Users/amine_rb/Desktop/Master IASD/coding/SyntheticEla/SROIE2019/train/fraud"  
+# SOURCE_DIR="/Users/amine_rb/Desktop/Master IASD/coding/SyntheticEla/NoisyMed/bills"   # dossier des images sources
+# OUTPUT_DIR="/Users/amine_rb/Desktop/Master IASD/coding/SyntheticEla/NoisyMed/bills_fraud"    # racine des sorties
+SOURCE_DIR="/Users/amine_rb/Desktop/Master IASD/coding/SyntheticEla/NoisyMed/discharge_summaries"   # dossier des images sources
+OUTPUT_DIR="/Users/amine_rb/Desktop/Master IASD/coding/SyntheticEla/NoisyMed/discharge_summaries_fraud"    # racine des sorties
 
 # --- Sonde du corpus ---------------------------------------------------------
 PROBE_RECURSIVE=true                         # parcourt les sous-dossiers
@@ -38,13 +42,17 @@ NONSTANDARD_ABSDIFF_THRESHOLD=40             # seuil "qtable non standard"
 # QUALITY_SWEEP = valeurs de Q2 (sauvegarde FINALE, hautes). Chaque doc en tire une.
 # Elles DOIVENT toutes être != ELA_QUALITY (sinon toute l'image est au point fixe
 # de la sonde et l'ELA s'effondre à 0 partout).
-QUALITY_SWEEP=(92 95 97)
+QUALITY_SWEEP=(90 93 96)
 # Écart de compression : Q1 = Q2 - Q1_GAP (borné >= 40). C'est LE bouton du signal.
-# Mesuré sur ce corpus (forgé/texte-authentique, la métrique qui compte) :
-#   gap 22 -> ~1.54 | gap 28 -> ~1.76 | gap 32 -> ~1.73 (plafonne).
-# Trop petit -> signal faible ; trop grand -> blocking Q1 visible sur tout le
-# document (le "document original" paraît dégradé). 28 = bon compromis.
-Q1_GAP=28
+# OPTION A (robustesse au Q1 d'inférence) : Q1_GAP est une PLAGE (min max) -> un gap
+# est tiré PAR DOCUMENT -> Q1 varie sur toute une bande au lieu d'une valeur unique.
+# Le modèle n'apprend donc PAS un Q1 fixe (ex. 67) et généralise à des documents
+# reçus à l'inférence dont la qualité de base diffère. Avec sweep (90 93 96) :
+#   Q1 ∈ [min(sweep)-max_gap, max(sweep)-min_gap] = [90-40, 96-16] = [50, 80].
+# Un scalaire (ex. Q1_GAP=28) reste accepté = Q1 quasi fixe (ancien comportement).
+# Plancher à 20 : sous ~20 le signal est trop faible (mesuré 22->~1.5). Avec sweep
+# (90 93 96) et gap ∈ [20,40] -> Q1 ∈ [90-40, 96-20] = [50, 76].
+Q1_GAP=(20 40)
 
 # --- Falsification -----------------------------------------------------------
 # Types à générer : UN SOUS-DOSSIER COMPLET ET SÉPARÉ par type (aucun tirage
@@ -68,6 +76,16 @@ N_FORGERIES=(1 5)
 # retombe sur le meilleur emplacement si la page est presque vide).
 PLACE_ON_CONTENT=true
 MIN_CONTENT_FRAC=0.02
+# Couleur de l'encre injectée par la substitution. Fraction des substitutions
+# rendues EN COULEUR (couleur saturée tirée au hasard, différente à chaque fois) ;
+# le reste est en encre sombre (quasi-noire) comme le texte du document.
+#   0.0 = tout en noir (défaut historique)  |  0.5 = moitié couleur / moitié noir.
+# But : que le modèle apprenne à détecter la fraude quelle que soit sa couleur.
+# ATTENTION : une fraude colorée est EFFACÉE par le filtre anti-couleur de l'ELA
+# (ELA_GRAYSCALE_INPUT / ELA_CHROMA_SUPPRESS). Pour détecter les fraudes colorées,
+# METS CE FILTRE À OFF (ELA_GRAYSCALE_INPUT=false, ELA_CHROMA_SUPPRESS=0) et laisse
+# l'autoencodeur gérer les logos via la nouveauté (cf. §7 README).
+SUBST_COLOR_PROB=0.5
 
 # --- Classes de taille de zone (fraction de surface page : MIN MAX) ----------
 SIZE_SMALL=(0.001 0.005)                     # ~0.1% – 0.5% de la page
@@ -76,7 +94,7 @@ SIZE_LARGE=(0.02 0.06)                       # 2% – 6%
 SIZE_VERY_LARGE=(0.06 0.15)                  # 6% – 15%
 
 # --- Négatifs (authentiques, masque vide) : part DANS CHAQUE sous-dossier -----
-NEGATIVES_RATIO=0.0                          # 0.0 = uniquement des falsifications
+NEGATIVES_RATIO=0                        # 0.0 = uniquement des falsifications
 KEEP_BENIGN_COLORED=true                     # préserve logos/tampons/en-têtes
 
 # --- Annotation (grille patch pour le modèle en aval) ------------------------
@@ -91,16 +109,17 @@ PATCH_POSITIVE_OVERLAP=0.5                   # patch positif si recouvrement > s
 # vient de la DIVERSITÉ de qualité (pas de la chroma) -> 3 canaux d'info pour le
 # modèle (mode E2 de detection_eval). La zone falsifiée réagit fortement aux 3 sondes.
 #
-# ELA_QUALITY = qualité CENTRALE. Choix CRITIQUE : viser ≈ Q1 (= médiane(Q2)−Q1_GAP),
-# le point fixe de compression du fond. Sonder à Q1 met le texte AUTHENTIQUE (qui a
-# l'historique Q1) à son minimum d'ELA tandis que la zone falsifiée (jamais vue à Q1)
-# explose -> contraste ~2× meilleur ET zone plus vive qu'à Q90.
-#   Mesuré : centre @90 -> forgé/auth 1.8 | centre @Q1(67) -> 3.2, zone 2.5× plus vive.
-# Les 3 qualités doivent rester DISTINCTES de tout Q2 du sweep (sinon ELA nulle). Ici
-# Q2∈{92,95,97}, Q1_GAP=28 -> Q1∈{64,67,69} -> centre 67. Si tu changes sweep/gap,
-# l'orchestrator affiche la valeur recommandée et alerte si tu es trop loin de Q1.
-ELA_QUALITY=67                               # centre ≈ Q1 (point fixe du fond) -> contraste max
-ELA_SPREAD=8                                 # écart des 3 canaux : (67-8, 67, 67+8) = 59/67/75
+# ELA_QUALITY / ELA_SPREAD = sonde FIXE (mêmes 3 qualités pour TOUS les docs, comme à
+# l'inférence où l'on ignore le Q1 du document). Les 3 canaux RGB = (ELA_QUALITY-SPREAD,
+# ELA_QUALITY, ELA_QUALITY+SPREAD), tous DISTINCTS de tout Q2 du sweep (sinon ELA -> 0).
+# IMPORTANT (mesuré, option A) : même quand Q1 varie sur [50,76], une sonde ÉTROITE à
+# 67 reste la MEILLEURE — la fraude (Q2 seul) ressort à beaucoup de qualités, pas
+# seulement à Q1 pile. Inutile d'élargir la sonde ; la robustesse au Q1 d'inférence
+# vient de la DIVERSITÉ de Q1 dans les DONNÉES (Q1_GAP plage), pas de la sonde.
+#   Grille sur données Q1∈[50,80] : 59/67/75 -> moy 2.04 | 57/65/73 -> 1.97 |
+#   53/63/73 -> 1.86 | 55/67/79 -> 1.86 | 50/65/80 -> 1.74. => 67/8 gagne.
+ELA_QUALITY=67                               # sonde fixe optimale (grille) même à Q1 variable
+ELA_SPREAD=8                                 # canaux 59/67/75
 ELA_N_SAMPLES=50                             # nb de planches image | ELA | masque
 # Échelle GLOBALE FIXE de l'ELA d'aperçu (pas d'étirement par max d'image, qui
 # écrasait les fraudes faibles). Aligne-la sur detection_eval.ELA_SCALE (=15).
@@ -112,11 +131,11 @@ ELA_SCALE=15
 #
 # 1) Gris AVANT l'ELA : effondre l'ELA du mobilier coloré CLAIR (mesuré 74 -> ~8),
 #    la fraude garde ~99 %. Ne suffit pas seul sur le coloré FONCÉ. true/false.
-ELA_GRAYSCALE_INPUT=true
+ELA_GRAYSCALE_INPUT=false
 # 2) Suppression chroma APRÈS l'ELA : efface les pixels colorés quelle que soit leur
 #    luminosité (chroma > seuil -> 0), donc rattrape le coloré foncé. Seuil ~20 :
 #    logo/tampon -> 0, fraude garde ~87 %. 0 = désactivé.
-ELA_CHROMA_SUPPRESS=20
+ELA_CHROMA_SUPPRESS=0
 
 # --- Orchestration -----------------------------------------------------------
 SEED=42                                      # seed global (reproductibilité)

@@ -87,6 +87,19 @@ does **not** produce a localizable signal; that approach was tried and removed. 
 back — the surface is a few scalars: `QUALITY_SWEEP` (the `Q2` values), `Q1_GAP`, and `ELA_QUALITY`
 /`ELA_SPREAD` (probe center ≈ `Q1` and channel spread).
 
+**`Q1_GAP` can be a scalar OR a range `(min max)` (option A, generalization).** A scalar fixes `Q1`
+(≈67); a range draws a per-document gap so `Q1 = Q2 − gap` **varies over a band** (e.g. sweep
+`(90 93 96)`, gap `(20 40)` → `Q1 ∈ [50, 76]`). This is what lets the model generalize to an
+inference document whose base quality is unknown — a model trained on a single `Q1` overfits it.
+Measured, and non-obvious: **do NOT widen the ELA probe to "cover" the `Q1` range** — a fixed narrow
+probe (`67/8` → 59/67/75) stays best even with `Q1 ∈ [50,80]` (grid: 67/8→2.04, 65/15→1.74), because
+the forgery (Q2-only) shows up at many probe qualities, not just at `Q1`. Robustness comes from `Q1`
+diversity **in the data**, not from the probe. With a varied `Q1`, forged/authentic-text ≈ **2.4**
+(vs ≈3–4 at a single perfectly-matched `Q1` — the expected robustness-vs-peak trade). Scope reminder:
+this detects **re-compression** (double-JPEG) forgeries; a document never double-compressed (single
+save / pristine) has no history discontinuity and is **not** detectable by ELA — state this as the
+method's validity domain.
+
 **ELA output is a colour RGB image**: `ela/*.png` stacks three ELA probes bracketing `Q1`
 (`ELA_QUALITY ± ELA_SPREAD`, e.g. 59/67/75) as R/G/B. The colour comes from *quality diversity*, not
 chroma (chroma ELA was measured anti-correlated here — it lights up authentic logos, not forgeries).

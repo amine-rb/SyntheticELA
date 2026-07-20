@@ -207,6 +207,27 @@ def resolve_edit_types(cfg: dict) -> list[str]:
     return ordered
 
 
+def parse_gap_range(cfg: dict) -> tuple[int, int]:
+    """(gap_min, gap_max) depuis compression.q1_gap (scalaire OU [min, max]).
+
+    OPTION A (robustesse au Q1 d'inférence) : un gap tiré PAR DOCUMENT dans
+    [min, max] fait varier Q1 = Q2 - gap sur une PLAGE -> le modèle ne surapprend
+    pas un Q1 unique (ex. 67) et généralise à des documents dont la qualité de base
+    diffère. gap_min == gap_max -> Q1 (quasi) fixe = ancien comportement.
+    """
+    g = cfg["compression"].get("q1_gap", 0)
+    if isinstance(g, (list, tuple)):
+        gmin, gmax = int(g[0]), int(g[-1])
+    else:
+        gmin = gmax = int(g)
+    gmax = max(gmin, gmax)
+    if gmin <= 0:
+        raise ValueError(
+            "compression.q1_gap doit être > 0 : sans écart Q1<Q2, la substitution "
+            "est indiscernable du texte authentique en ELA (aucun signal exploitable).")
+    return gmin, gmax
+
+
 def plan_jobs(cfg: dict, source_paths: list[str], edit_type: str,
               doc_prefix: str, type_index: int = 0) -> list[Job]:
     """Jobs déterministes pour UN SEUL type d'édition (un sous-dossier).
@@ -228,11 +249,7 @@ def plan_jobs(cfg: dict, source_paths: list[str], edit_type: str,
     if not quality_sweep:
         raise ValueError(
             "compression.quality_sweep est vide : liste au moins une qualité JPEG.")
-    q1_gap = int(cfg["compression"].get("q1_gap", 0))
-    if q1_gap <= 0:
-        raise ValueError(
-            "compression.q1_gap doit être > 0 : sans écart Q1<Q2, la substitution "
-            "est indiscernable du texte authentique en ELA (aucun signal exploitable).")
+    gap_min, gap_max = parse_gap_range(cfg)   # OPTION A : gap (donc Q1) variable par doc
     neg_ratio = float(cfg["negatives"]["ratio"])
     aligned_ratio = float(cfg["forger"]["aligned_ratio"])
     # size_classes ORDONNÉES du plus petit au plus grand (ordre du config).
@@ -252,7 +269,11 @@ def plan_jobs(cfg: dict, source_paths: list[str], edit_type: str,
         # couple (Q1, Q2) est appliqué aux positifs COMME aux négatifs (aucune fuite
         # qualité globale -> le modèle doit LOCALISER l'écart, pas le lire au niveau page).
         q2 = int(quality_sweep[i % len(quality_sweep)])
-        q1 = max(40, q2 - q1_gap)
+        # OPTION A : gap tiré PAR DOC (jrng, déterministe) -> Q1 = Q2 - gap varie sur
+        # [min(sweep)-gap_max, max(sweep)-gap_min]. MÊME tirage pour positifs ET
+        # négatifs -> pas de fuite de qualité au niveau page, le modèle doit localiser.
+        gap = int(jrng.integers(gap_min, gap_max + 1))
+        q1 = max(40, q2 - gap)
         source_path = str(master.choice(source_paths))
         is_negative = bool(master.random() < neg_ratio)
         # Nommage HONNÊTE : un négatif n'est PAS une falsification du type courant.
@@ -338,6 +359,8 @@ def _run_job(job: Job, cfg: dict, out_dirs: dict, nonstd_thr: float) -> dict:
         # Lever 1 : placement sur du contenu réel (encre) plutôt que dans le vide.
         on_content = bool(cfg["forger"].get("place_on_content", False))
         min_content_frac = float(cfg["forger"].get("min_content_frac", 0.0))
+        # Fraction des substitutions rendues en COULEUR (0 = tout noir).
+        color_prob = float(cfg["forger"].get("subst_color_prob", 0.0))
 
         # ---- k falsifications (MÊME type, MÊME classe de taille) accumulées ----
         # Chaque passe édite l'image courante et évite les zones déjà falsifiées
@@ -353,6 +376,7 @@ def _run_job(job: Job, cfg: dict, out_dirs: dict, nonstd_thr: float) -> dict:
                 donor=donor_rgb, donor_id=donor_id,
                 min_region_px=min_region_px, forbid=forgery_bboxes,
                 on_content=on_content, min_content_frac=min_content_frac,
+                color_prob=color_prob,
             )
             edited = forge_res.image
             mask = np.maximum(mask, forge_res.mask)
@@ -530,24 +554,32 @@ def run(cfg: dict, limit: Optional[int] = None, workers: Optional[int] = None) -
     # original"), puis sauvegarde finale à Q2 (haute). Les PNG lossless sont gérés
     # nativement — l'historique vient entièrement de la passe Q1.
     sweep = [int(q) for q in cfg["compression"]["quality_sweep"]]
-    gap = int(cfg["compression"].get("q1_gap", 0))
-    ela_q = int(cfg.get("ela", cfg.get("ela_preview", {})).get("ela_quality", 90))
-    q1_vals = sorted({max(40, q - gap) for q in sweep})
-    q1_reco = int(round(float(np.median(q1_vals))))   # sonde optimale ≈ Q1 (point fixe du fond)
-    # GARDE-FOU DUR : si une Q2 du sweep == qualité de sonde ELA, toute l'image est au
-    # point fixe de la sonde et l'ELA s'effondre à 0 (aucune séparabilité).
-    if ela_q in sweep:
+    gap_min, gap_max = parse_gap_range(cfg)
+    ela_cfg = cfg.get("ela", cfg.get("ela_preview", {}))
+    ela_q = int(ela_cfg.get("ela_quality", 90))
+    ela_spread = int(ela_cfg.get("ela_spread", 8))
+    # PLAGE de Q1 réellement générée (OPTION A : gap tiré par doc) : Q1 = Q2 - gap.
+    q1_lo = max(40, min(sweep) - gap_max)
+    q1_hi = max(40, max(sweep) - gap_min)
+    q1_reco = int(round((q1_lo + q1_hi) / 2.0))       # centre de sonde ≈ milieu de la plage Q1
+    channels = ela_qualities(ela_q, ela_spread)       # 3 sondes FIXES = canaux RGB (stratégie d'inférence)
+    # GARDE-FOU DUR : aucune sonde ne doit coïncider avec un Q2 (image au point fixe
+    # de la sonde -> ELA s'effondre à 0, aucune séparabilité).
+    clash = sorted(set(channels) & set(sweep))
+    if clash:
         raise ValueError(
-            f"ELA_QUALITY={ela_q} coïncide avec une valeur de QUALITY_SWEEP ({sweep}) : "
-            "l'ELA s'effondrerait à 0 (image au point fixe de la sonde). Choisis "
-            f"ELA_QUALITY ≈ Q1 (recommandé : {q1_reco}).")
-    # ALERTE SOUPLE : la sonde doit viser Q1 (fond au point fixe -> contraste max).
-    # Trop loin de Q1 => signal faible (on l'a mesuré : @90 donne ~1.8 vs @Q1 ~3.2).
-    if abs(ela_q - q1_reco) > 8:
-        print(f"      ⚠️  ELA_QUALITY={ela_q} est loin de Q1≈{q1_reco} "
-              f"(Q1∈{q1_vals}) : contraste ELA sous-optimal. Recommandé : ELA_QUALITY={q1_reco}.")
-    print(f"      compression : Q2 (sweep) = {sweep}, Q1 = Q2-{gap} = {q1_vals}, "
-          f"sonde ELA = {ela_q} (optimum ≈ Q1 = {q1_reco})")
+            f"Sonde(s) ELA {clash} coïncide(nt) avec QUALITY_SWEEP ({sweep}) : l'ELA "
+            f"s'effondrerait à 0. Garde ELA_QUALITY±ELA_SPREAD hors du sweep "
+            f"(Q1 ∈ [{q1_lo}, {q1_hi}]).")
+    # NB (mesuré, option A) : une sonde FIXE (ex. 59/67/75) reste la meilleure même
+    # quand Q1 varie sur toute la plage — la fraude (Q2 seul) ressort à beaucoup de
+    # qualités de sonde, pas seulement à Q1 pile. Pas besoin d'élargir la sonde ;
+    # c'est la DIVERSITÉ de Q1 dans les données (gap tiré par doc) qui donne la
+    # robustesse au Q1 d'inférence. Alerte seulement si la sonde est absurde.
+    if not (40 <= ela_q < min(sweep)):
+        print(f"      ⚠️  ELA_QUALITY={ela_q} hors de [40, {min(sweep)}[ : sonde peu utile.")
+    print(f"      compression : Q2 (sweep) = {sweep}, gap ∈ [{gap_min}, {gap_max}] "
+          f"-> Q1 ∈ [{q1_lo}, {q1_hi}] (tiré par doc) ; sondes ELA (RGB) = {channels}")
 
     # Snapshot corpus-level à la racine (référence commune).
     with open(os.path.join(out_root, "distribution.json"), "w") as f:

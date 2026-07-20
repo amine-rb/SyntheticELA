@@ -86,7 +86,7 @@ crée le signal** : le fond et tout le texte **authentique** portent l'historiqu
 `Q1→Q2`, tandis que la substitution, peinte en pixels **neufs entre les deux
 passes**, n'a subi que `Q2`. Sondée en ELA (à une qualité **≠ `Q2`**), la zone
 n'ayant vu que `Q2` **ressort du texte ordinaire** (mesuré : *forgé/texte-authentique
-≈ 1,8* à `Q1_GAP=28`). Le négatif subit exactement le même double-passage `Q1→Q2`
+≈ 1,8–1,9* avec `Q1` variable — cf. option A, §7). Le négatif subit exactement le même double-passage `Q1→Q2`
 (seule la substitution manque) → ELA propre, **indiscernable du fond d'un positif** :
 aucun indice global, le modèle doit **localiser**.
 
@@ -227,7 +227,7 @@ Généré automatiquement à la fin de chaque génération (regénérable seul :
 
 ## 7. Compression : un écart de qualité `Q1 < Q2` par document
 
-Deux boutons seulement : `QUALITY_SWEEP` (les valeurs de `Q2`, save final) et
+Deux boutons de base : `QUALITY_SWEEP` (les valeurs de `Q2`, save final) et
 `Q1_GAP` (l'écart). Chaque document tire un `Q2` dans le sweep et pose
 `Q1 = Q2 − Q1_GAP` :
 
@@ -262,6 +262,51 @@ falsification. Mesuré (corpus StaVer, `Q2∈{92,95,97}`, `Q1_GAP=28` → `Q1∈
 L'écart `Q1_GAP` compte aussi (à sonde ≈ Q1) : 22→~2.5, **28→~3.2**, 32→plafonne.
 En `Q1==Q2` : **≈ 1.0** ❌ (indiscernable, aucun signal).
 
+### `Q1_GAP` peut être une PLAGE — robustesse au Q1 d'inférence (option A)
+
+`Q1_GAP` accepte un **scalaire** (Q1 quasi fixe, ancien comportement) **ou une plage
+`(min max)`** : un gap est alors tiré **par document**, donc `Q1 = Q2 − gap` **varie
+sur toute une bande**. Ex. `QUALITY_SWEEP=(90 93 96)`, `Q1_GAP=(20 40)` → `Q1 ∈ [50, 76]`.
+
+Pourquoi : un modèle entraîné sur un `Q1` unique (67) le **surapprend** et échoue sur
+un document reçu à l'inférence dont la qualité de base diffère. Faire varier `Q1` dans
+les **données** force le modèle à généraliser.
+
+> **Non-évident (mesuré).** Ne **pas** élargir la sonde ELA pour « couvrir » la plage
+> de `Q1`. Une sonde **étroite fixe** (`67/8` → 59/67/75) reste la meilleure même à
+> `Q1 ∈ [50, 80]` (grille : `67/8`→2,04 · `65/15`→1,74), car la fraude (Q2 seul)
+> ressort à **beaucoup** de qualités de sonde, pas seulement à `Q1` pile. La robustesse
+> vient de la diversité de `Q1` **dans les données**, pas de la sonde. Avec `Q1` varié :
+> forgé/texte-authentique ≈ **1,8–2,4** (vs ~3,2 à `Q1` unique parfaitement sondé — le
+> compromis robustesse/pic attendu).
+
+> **Périmètre (limite structurelle).** L'ELA détecte une fraude par **re-compression**
+> (double JPEG). Un document **jamais double-compressé** (save unique, image vierge)
+> n'a **aucune discontinuité d'historique** → il n'est **pas** détectable par cette
+> méthode. Ce n'est pas un bug : c'est le domaine de validité de l'ELA.
+
+### Réduire les faux positifs colorés (logos / tampons / cachets)
+
+Le mobilier authentique **coloré** (logos, tampons) s'allume en ELA **aussi fort qu'une
+fraude** (mesuré ELA ≈ 74 vs 82) : c'est le faux positif dominant. Or une substitution
+est du **texte noir** (chroma ≈ 3) alors que ces éléments sont **colorés** (chroma ≈ 40)
+→ la **couleur** est le discriminant, utilisé **en négatif**. Deux boutons **cumulables**
+dans `compute_ela_stack` (valides **tant que la fraude est achromatique** ; à désactiver
+si l'on falsifie du coloré) :
+
+- **`ELA_GRAYSCALE_INPUT`** (true/false) — passe l'image en **gris avant** l'ELA. Un
+  logo coloré a d'énormes bords **par canal** ; le gris les moyenne → l'ELA du coloré
+  **clair** s'effondre (74→~8), la fraude noire garde ~99 %. La sortie RGB survit (ses
+  3 canaux viennent des 3 **qualités**, pas de la couleur de l'image).
+- **`ELA_CHROMA_SUPPRESS`** (défaut 20 ; 0=off) — pondère l'ELA par
+  `w = clip(1 − chroma/seuil, 0, 1)`, chroma mesurée sur l'**original couleur** même si
+  l'ELA est en gris → efface les pixels colorés **quelle que soit leur luminosité**
+  (rattrape le coloré **foncé** que le gris seul laisse passer).
+
+Cumulés (gris → chroma) : logo/tampon → 0, fraude ~86 %, ratio forgé/texte-auth
+1,79 → 1,93. Ces mêmes flags s'appliquent aussi à `scripts/ela.sh`
+(`--grayscale-input` / `--chroma-suppress`).
+
 ### ELA de sortie = image COULEUR RGB (3 qualités)
 
 `ela/*.png` est une **image RGB** : les 3 canaux sont l'ELA à 3 qualités encadrant `Q1`
@@ -288,16 +333,18 @@ d'info** au modèle (= mode E2 de `detection_eval`).
 | `SOURCE_DIR`, `OUTPUT_DIR` | corpus source & racine de sortie |
 | `CANDIDATE_EXT`, `ALLOW_LOSSLESS` | extensions acceptées, prise en charge lossless (PNG) |
 | `QUALITY_SWEEP` | valeurs de `Q2` (save final, hautes) tirées par document (§7) — **toutes ≠ `ELA_QUALITY`** |
-| `Q1_GAP` | écart de compression : `Q1 = Q2 − Q1_GAP` (§7) — **le bouton du signal**, défaut `28` |
+| `Q1_GAP` | écart de compression : `Q1 = Q2 − Q1_GAP` (§7) — **le bouton du signal** ; scalaire (Q1 fixe) **ou plage `(min max)`** → Q1 varie par doc (option A), défaut `(20 40)` |
 | `EDIT_TYPES` | types générés — **un sous-dossier par type** (viser `substitution`) |
 | `N_FORGERIES` | `(min max)` falsifications par doc — plafond de taille auto (§4) |
 | `MIN_REGION_PX` | `(largeur hauteur)` taille min garantie de zone (§4) |
 | `PLACE_ON_CONTENT`, `MIN_CONTENT_FRAC` | placer les fraudes sur du contenu réel (§4) |
+| `SUBST_COLOR_PROB` | fraction des substitutions rendues **en couleur** (teinte aléatoire) vs noir ; `0`=tout noir. Si `>0`, mettre le filtre couleur ELA à OFF (§7) sinon la fraude colorée est effacée |
 | `ALIGNED_RATIO`, `FEATHER_RADIUS_PX` | alignement grille 8×8, adoucissement anti-tell |
 | `SIZE_SMALL … SIZE_VERY_LARGE` | tailles de zone (fraction de page, min max) |
 | `NEGATIVES_RATIO` | part d'authentiques par sous-dossier (`0.0` = que des fraudes) |
 | `INPUT_RES`, `PATCH_SIZE`, `PATCH_GRID`, `PATCH_POSITIVE_OVERLAP` | grille patch |
-| `ELA_QUALITY`, `ELA_SPREAD` | sonde ELA : centre ≈ Q1 + écart des 3 canaux RGB (§7) |
+| `ELA_QUALITY`, `ELA_SPREAD` | sonde ELA : centre ≈ Q1 + écart des 3 canaux RGB (§7) — sonde **fixe étroite** même à Q1 variable |
+| `ELA_GRAYSCALE_INPUT`, `ELA_CHROMA_SUPPRESS` | anti-faux-positifs colorés : gris avant l'ELA + suppression chroma après (§7) |
 | `ELA_N_SAMPLES`, `ELA_SCALE` | nb de planches QA ; échelle ELA globale fixe |
 | `SEED`, `N_DOCS`, `N_WORKERS` | reproductibilité, lot **par type**, parallélisme |
 | `PYTHON` | interpréteur (celui qui a les dépendances) |
@@ -314,7 +361,7 @@ Surcharges CLI (sans éditer `config.sh`) : `--src`, `--out`, `--n`, `--workers`
 | `recompress`  | Décode la source ; `recompress_to_q1` (base @Q) ; `save_q2` (save final @Q, même qualité). |
 | `forger`      | substitution / copy_move / splice ; multi-falsification ; feather anti-tell ; taille min garantie. |
 | `annotator`   | Masque exact, bbox, grille patch 24×24, métadonnées JSON. |
-| `orchestrator`| Batch scriptable, un sous-dossier autonome par type, seeds déterministes, mode Q1 auto, manifeste. |
+| `orchestrator`| Batch scriptable, un sous-dossier autonome par type, seeds déterministes, tirage `Q1`/`Q2` par doc, manifeste. |
 | `aggregate`   | Fusionne les sous-dossiers de types en un dataset unique (`_aggregated/`). |
 | `reporter`    | `REPORT.md` (résultats du run + séparabilité ELA). |
 | `ela_scan`    | ELA RGB 3 qualités ≈ Q1 (mêmes paramètres que la sortie) sur un dossier d'images quelconque, falsifié ou non. |
@@ -329,7 +376,7 @@ Surcharges CLI (sans éditer `config.sh`) : `--src`, `--out`, `--n`, `--workers`
   quel que soit le nombre de workers (chaque job forge avec son propre seed).
 - Chaque type reçoit un flux aléatoire décorrélé → aucun doublon exact entre
   sous-dossiers à l'agrégation.
-- `run_config.yaml` fige la config effective (dont le mode Q1 résolu) de chaque lot.
+- `run_config.yaml` fige la config effective (dont la plage `Q1_GAP` résolue) de chaque lot.
 
 ---
 
