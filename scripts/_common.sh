@@ -72,6 +72,7 @@ gen_config() {
         echo "negatives:"
         echo "  ratio: ${NEGATIVES_RATIO}"
         echo "  keep_benign_colored: ${KEEP_BENIGN_COLORED}"
+        echo "  rotations: [$(IFS=', '; echo "${NEGATIVE_ROTATIONS[*]:-}")]"
 
         echo "annotator:"
         echo "  input_res: ${INPUT_RES}"
@@ -87,6 +88,7 @@ gen_config() {
         echo "  ela_scale: ${ELA_SCALE}"
         echo "  chroma_suppress: ${ELA_CHROMA_SUPPRESS}"
         echo "  grayscale_input: ${ELA_GRAYSCALE_INPUT}"
+        echo "  rotations: [$(IFS=', '; echo "${ELA_ROTATIONS[*]:-}")]"
         echo "  join: ${JOIN:-false}"
 
         echo "orchestrator:"

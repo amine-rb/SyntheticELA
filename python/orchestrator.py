@@ -99,7 +99,8 @@ def ela_qualities(center: int, spread: int) -> list[int]:
 
 def compute_ela_stack(img_path: str, qualities: list[int], scale: float,
                       chroma_suppress: float = 0.0,
-                      grayscale_input: bool = False) -> np.ndarray:
+                      grayscale_input: bool = False,
+                      rotate: int = 0) -> np.ndarray:
     """3-quality ELA stack -> (H, W, 3) uint8 RGB, on the re-read FINAL JPEG.
 
     Channel k = |image - recompress(image, qualities[k])| averaged over channels, at a
@@ -120,8 +121,20 @@ def compute_ela_stack(img_path: str, qualities: list[int], scale: float,
       WHATEVER its luminosity (chroma > threshold -> w=0). 0 = disabled.
     Both valid FOR SUBSTITUTION (achromatic forgery); disable if
     forging a colored region.
+
+    `rotate` (degrees, default 0) rotates the source image BEFORE the ELA — a
+    data-augmentation hook (used by `ela_scan`): the whole document (and its
+    chroma) is rotated, then ELA is recomputed, simulating a doc scanned in
+    another orientation. Multiples of 90 are exact (pixel permutation, np.rot90);
+    other angles use expand-rotation (introduces border pixels).
     """
     orig = np.asarray(Image.open(img_path).convert("RGB"), dtype=np.uint8)  # kept for chroma
+    if rotate % 360:
+        if rotate % 90 == 0:
+            orig = np.ascontiguousarray(np.rot90(orig, k=(rotate // 90) % 4))  # exact
+        else:
+            orig = np.asarray(Image.fromarray(orig).rotate(-rotate, expand=True,
+                                                           resample=Image.BICUBIC))
     if grayscale_input:
         g = cv2.cvtColor(orig, cv2.COLOR_RGB2GRAY)
         img = cv2.cvtColor(g, cv2.COLOR_GRAY2RGB).astype(np.int16)          # 3 identical gray channels
@@ -261,6 +274,7 @@ class Job:
     q1: Optional[int] = None        # None = native mode (Q0 read); otherwise controlled Q1
     n_forgeries: int = 1            # number of forgeries (same type) on this positive doc
     stem: str = ""                  # stem of the SOURCE NAME -> output names {stem}_{n}...
+    rotate: int = 0                 # NEGATIVE augmentation: rotate the doc before Q2+ELA (deg); 0 = none
 
 
 # ------------------------------------------------------------------ planning
@@ -348,6 +362,13 @@ def plan_jobs(cfg: dict, source_paths: list[str], edit_type: str,
     # Number of forgeries per positive doc: k ~ U{n_min..n_max} (same type).
     n_min, n_max = (list(cfg["forger"].get("n_forgeries", [1, 1])) + [1])[:2]
     n_min, n_max = int(n_min), int(max(int(n_min), int(n_max)))
+    # NEGATIVE augmentation pool (EXPANSION): each selected negative is emitted ONCE PER
+    # angle in this pool -> #negatives = (selected negatives) * len(pool). Add 0 to the
+    # pool to also keep the upright version. Empty pool -> a single upright copy (count
+    # unchanged). Positives are never rotated (their mask/bbox would need to follow).
+    # Dedup, normalized to [0,360).
+    neg_rots = [int(r) % 360 for r in (cfg["negatives"].get("rotations", []) or [])]
+    neg_rots = list(dict.fromkeys(neg_rots))
 
     # Assignment of sources WITHOUT REPLACEMENT if the corpus is large enough (each source
     # doc used at most once -> unique output stems, 1:1 traceability). With replacement
@@ -399,11 +420,19 @@ def plan_jobs(cfg: dict, source_paths: list[str], edit_type: str,
         doc_id = f"{stem}_{k}"
 
         if is_negative:
-            jobs.append(Job(
-                doc_id=doc_id, seed=seed, q2=q2, is_negative=True,
-                source_path=source_path, edit_type=None, size_class=None,
-                alignment=None, donor_path=None, q1=q1, n_forgeries=0, stem=stem,
-            ))
+            # EXPANSION: emit one negative per angle in the pool (a rot!=0 variant gets a
+            # `_rot{deg}` suffix -> unique filenames; the 0 angle keeps the base name).
+            # Same seed/Q1/Q2 -> each is the same authentic doc, only re-oriented
+            # (rotation applied in _run_job before the Q2 save + ELA).
+            for r in (neg_rots or [0]):
+                v_stem = stem if r == 0 else f"{stem}_rot{r}"
+                v_id = doc_id if r == 0 else f"{v_stem}_0"
+                jobs.append(Job(
+                    doc_id=v_id, seed=seed, q2=q2, is_negative=True,
+                    source_path=source_path, edit_type=None, size_class=None,
+                    alignment=None, donor_path=None, q1=q1, n_forgeries=0,
+                    stem=v_stem, rotate=r,
+                ))
             continue
 
         # SIZE CAP based on k: the more there are, the smaller they are (avoids
@@ -509,6 +538,21 @@ def _run_job(job: Job, cfg: dict, out_dirs: dict, nonstd_thr: float) -> dict:
         edit_type, size_class, alignment = job.edit_type, job.size_class, job.alignment
         bbox = ann.bbox_from_mask(mask)            # bounding box of the UNION
 
+    # ---- NEGATIVE augmentation: rotate the finished (Q1-historied) pixels BEFORE the
+    #      Q2 save + ELA, simulating an authentic doc scanned in another orientation.
+    #      Multiples of 90 are EXACT pixel permutations -> the Q1->Q2 double-JPEG history
+    #      is preserved (block grid transposed). Only negatives carry rotate != 0
+    #      (positives never rotate, so their mask/bbox stay valid). ----
+    if job.rotate % 360:
+        if job.rotate % 90 == 0:
+            edited = np.ascontiguousarray(np.rot90(edited, k=(job.rotate // 90) % 4))
+            mask = np.ascontiguousarray(np.rot90(mask, k=(job.rotate // 90) % 4))
+        else:
+            edited = np.asarray(Image.fromarray(edited).rotate(
+                -job.rotate, expand=True, resample=Image.BICUBIC))
+            mask = np.asarray(Image.fromarray(mask).rotate(
+                -job.rotate, expand=True, resample=Image.NEAREST))
+
     # Output names = stem of the SOURCE file + number of forgeries (0 if negative).
     #   image {stem}_{n}.jpg (== doc_id) | mask {stem}_mask_{n}.png | ELA {stem}_ela_{n}.png
     n = 0 if job.is_negative else int(job.n_forgeries)
@@ -579,6 +623,7 @@ def _run_job(job: Job, cfg: dict, out_dirs: dict, nonstd_thr: float) -> dict:
     # Multi-forgery: number of zones + bbox of EACH ONE (the `bbox` field is
     # the bounding box of the union, coarse; here the region-by-region ground truth).
     meta["n_forgeries"] = 0 if job.is_negative else int(job.n_forgeries)
+    meta["rotation"] = int(job.rotate)         # negative augmentation angle (0 = none)
     meta["forgery_bboxes"] = forgery_bboxes
     meta["patch_grid"] = labels.tolist()
     meta["ela"] = {"qualities": ela_qs, "center": ela_center, "spread": ela_spread,

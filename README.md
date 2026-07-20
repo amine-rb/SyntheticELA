@@ -179,6 +179,29 @@ gibberish) — cf. the generator's "tell", `markdown/plan.md` §8.
 > per-image max stretch — the preview reflects what the model "sees" and no longer
 > washes out weak forgeries.
 
+### Rotation augmentation (negatives only)
+
+**`NEGATIVE_ROTATIONS`** (RUN) multiplies the authentic (negative) documents by
+re-orienting them: **each selected negative is emitted once per angle** in the pool,
+so `#negatives = (selected negatives) × len(pool)` (e.g. `N_DOCS=5`, all-negative,
+`(90 180 270)` → **15** documents). Add `0` to the pool to also keep the upright
+version (`(0 90 180 270)` → 20); `()` = upright only (no augmentation).
+
+Each rotated copy is a **full standalone document** (own `image`/`mask`/`ela`/`json`),
+with the **same seed / `Q1` / `Q2`** as its source — it stays a legit double-JPEG
+authentic, only re-oriented. The rotation is applied to the finished (Q1-historied)
+pixels **before** the `Q2` save + ELA, so `image`, `mask` and `ELA` stay pixel-aligned;
+multiples of 90 are **exact** pixel permutations (the block grid is transposed, the
+history preserved). Rotated files carry a `_rot{deg}` suffix; the applied angle is
+logged in the JSON (`"rotation"`). **Positives are never rotated** (their mask/bbox
+would have to follow) — rotation targets negatives, the orientation the model
+overfits most.
+
+**`ELA_ROTATIONS`** (ELA) is the analogous augmentation for `ela.sh`: on top of the
+`0°` ELA of every image, it writes one extra ELA per rotation (rotated source → ELA
+recomputed), suffixed `_rot{deg}`, with a `rotation` column in `ela.csv`. Here `0°` is
+**always** emitted (it augments, it does not replace).
+
 ---
 
 ## 5. Outputs (one SELF-CONTAINED subfolder per type)
@@ -219,7 +242,9 @@ produced for **all** images (positives AND negatives: the negative's ELA is the
 Each artifact keeps the **source document's name** to trace output → source:
 `X0001.jpg` → image `X0001_<n>.jpg`, mask `X0001_mask_<n>.png`, ELA `X0001_ela_<n>.png`,
 JSON `X0001_<n>.json`. A **negative** has `n = 0` (empty mask); a positive with 3 zones has `n = 3`.
-The `id` (= image stem, `<stem>_<n>`) is consistent with `detection_eval` (the mask
+A **rotated negative** (`NEGATIVE_ROTATIONS`, §4) inserts a `_rot{deg}` suffix into the
+stem: `X0001_rot90_0.jpg` (+ mask/ELA/JSON); the angle is also logged in the JSON
+(`"rotation"`). The `id` (= image stem, `<stem>_<n>`) is consistent with `detection_eval` (the mask
 is derived from it) — it is the `id` of `images.csv`/`masks.csv`/`ela.csv`. Sources are
 drawn **without replacement** as long as the corpus is large enough (1 source doc ↔ 1 output); in
 case of forced reuse, a suffix guarantees uniqueness.
@@ -396,10 +421,12 @@ to the script(s) that read it:
 | `SIZE_SMALL … SIZE_VERY_LARGE` | RUN | zone size classes (page fraction, `min max`) |
 | `NEGATIVES_RATIO` | RUN | fraction of authentics per subfolder (high for an anomaly training set, ~0.5 for a test set) |
 | `KEEP_BENIGN_COLORED` | RUN | preserve benign colored furniture (logos/stamps/headers) from real documents |
+| `NEGATIVE_ROTATIONS` | RUN | rotation augmentation of **negatives** (§4): each negative emitted **once per angle** → `#neg = selected × len(pool)`. Add `0` to also keep upright; `()`=upright only. Positives never rotated |
 | `INPUT_RES`, `PATCH_SIZE`, `PATCH_GRID`, `PATCH_POSITIVE_OVERLAP` | RUN | ground-truth patch grid (24×24 on 384, patch positive if overlap > threshold) |
 | `ELA_N_SAMPLES` | RUN | number of QA panels `image \| ELA \| mask` |
 | `SEED`, `N_DOCS`, `N_WORKERS` | RUN | reproducibility, batch **per type and per corpus**, parallelism; `N_DOCS=""` → as many documents as source images (y=x) |
 | `ELA_INPUT_DIR`, `ELA_OUTPUT_DIR`, `ELA_RECURSIVE` | ELA | defaults for `ela.sh` when `--in/--out` are absent; `""` → 1st RUN corpus and `<output>/_ela_scan` |
+| `ELA_ROTATIONS` | ELA | augment `ela.sh`: extra ELA per rotation angle (§4), suffixed `_rot{deg}`, `rotation` column in `ela.csv`; `0°` always emitted; `()`=none |
 | `AGG_OUTPUT_DIR`, `AGG_TYPES`, `AGG_MODE`, `AGG_DEST` | AGG | defaults for `aggregate.sh`: corpus to merge (`""`→`RUN_OUTPUT_DIRS[0]`), types (`()`=all), mode `copy\|symlink\|hardlink`, subfolder name |
 
 **Measured values (reference).** ELA probe on `Q1∈[40,81], Q2∈[72,96]` (50 docs,
@@ -410,7 +437,8 @@ not only at Q1): robustness to the inference Q1 comes from **Q1 diversity
 in the data** (gap drawn per doc), not from a wide probe (cf. §7).
 
 CLI overrides (without editing `config.sh`): `--src`, `--out`, `--n`, `--workers`
-(applied to all corpora); for `ela.sh`: `--in`, `--out`, `--recursive`.
+(applied to all corpora); for `ela.sh`: `--in`, `--out`, `--recursive`, `--rotations`
+(e.g. `--rotations 90 180 270`, or `--rotations` alone = none).
 
 ---
 

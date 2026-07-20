@@ -64,6 +64,7 @@ SIZE_VERY_LARGE=(0.06 0.15)                   # 6% – 15%
 
 NEGATIVES_RATIO=1                            # fraction of authentics/subfolder (high=anomaly train, ~0.5=test)
 KEEP_BENIGN_COLORED=true                      # preserve logos/stamps/headers
+NEGATIVE_ROTATIONS=(0 90 180 270)               # augment: each NEGATIVE emitted once PER angle => #neg = selected * len(pool) (e.g. n_docs=5 => 15). Add 0 to also keep upright; ()=upright only. Positives never rotated
 
 INPUT_RES=384                                 # input resolution of the downstream model
 RESIZE_384=true                             # true: deliver every doc (forged or not) as INPUT_RESxINPUT_RES (square) -> images/masks/ela model-ready, CSV points to 384x384 files. Resize is applied AFTER the native Q1->Q2 + ELA (ELA computed natively then downscaled, else text saturates). false: keep native size
@@ -75,7 +76,7 @@ ELA_N_SAMPLES=50                              # number of QA boards image | ELA 
 JOIN=true                                     # extra join/ subfolder: image | ELA | mask stitched side-by-side per doc (visual check)
 
 SEED=42                                       # global seed (reproducibility)
-N_DOCS=15                                    # docs PER TYPE and PER corpus; "" = as many as source images (y=x, one forgery/image); else an integer y (y<x = subsample, y>x = sources reused with a different forgery)
+N_DOCS=2                                   # docs PER TYPE and PER corpus; "" = as many as source images (y=x, one forgery/image); else an integer y (y<x = subsample, y>x = sources reused with a different forgery)
 N_WORKERS=4                                   # parallelism
 
 
@@ -84,6 +85,7 @@ N_WORKERS=4                                   # parallelism
 ELA_INPUT_DIR="/Users/amine_rb/Desktop/Master IASD/coding/SyntheticEla/data/Signatures"                              # folder of docs to analyze
 ELA_OUTPUT_DIR="/Users/amine_rb/Desktop/Master IASD/coding/SyntheticEla/data/Signatures/ela"                             # output folder for the *_ela.png
 ELA_RECURSIVE=true                            # walk the subfolders of --in
+ELA_ROTATIONS=(90 180 270)                    # data augmentation: extra ELA per rotation (deg); 0° always emitted; ()=none
 
 
 # ##################### [AGGREGATE] — aggregate.sh (merge the types) ##########
