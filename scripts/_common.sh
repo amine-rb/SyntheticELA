@@ -75,6 +75,7 @@ gen_config() {
 
         echo "annotator:"
         echo "  input_res: ${INPUT_RES}"
+        echo "  resize_square: ${RESIZE_384}"
         echo "  patch_size: ${PATCH_SIZE}"
         echo "  patch_grid: ${PATCH_GRID}"
         echo "  patch_positive_overlap: ${PATCH_POSITIVE_OVERLAP}"

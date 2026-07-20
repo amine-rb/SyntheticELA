@@ -63,6 +63,28 @@ import annotator as ann
 _SUBSAMPLING_INT2STR = {0: "4:4:4", 1: "4:2:2", 2: "4:2:0"}
 
 
+def _resize_square(rgb: np.ndarray, size: int) -> np.ndarray:
+    """Resize an (H, W, 3) RGB image to a square (size, size).
+
+    Applied to the DECODED source BEFORE the Q1->Q2 pass (see `_run_job`), so the
+    whole forensic chain (Q1 history, fresh-pixel forgery, Q2 save, exact mask, ELA,
+    patch grid) is produced natively at the target resolution and stays pixel-aligned.
+    INTER_AREA when shrinking (the usual case: docs > 384), INTER_CUBIC when upscaling.
+    """
+    h, w = rgb.shape[:2]
+    interp = cv2.INTER_AREA if (size < h or size < w) else cv2.INTER_CUBIC
+    return cv2.resize(rgb, (size, size), interpolation=interp)
+
+
+def _scale_bbox(b, sx: float, sy: float):
+    """Scale a (x, y, w, h) bbox by (sx, sy) for the square-resized delivery. None-safe."""
+    if not b:
+        return b
+    x, y, w, h = b
+    return [int(round(x * sx)), int(round(y * sy)),
+            max(1, int(round(w * sx))), max(1, int(round(h * sy)))]
+
+
 # ------------------------------------------------------------------ ELA + CSV
 def ela_qualities(center: int, spread: int) -> list[int]:
     """3 ELA probe qualities (R,G,B channels) = (center-spread, center, center+spread).
@@ -388,6 +410,15 @@ def _run_job(job: Job, cfg: dict, out_dirs: dict, nonstd_thr: float) -> dict:
     q2_sub_str = _SUBSAMPLING_INT2STR.get(DEFAULT_Q2_SUBSAMPLING, "4:2:0")
     ann_cfg = cfg["annotator"]
 
+    # Optional square resize to the model's input resolution. FORENSIC ORDER MATTERS:
+    # the whole chain (Q1->Q2, forgery, ELA) runs at NATIVE resolution, and the resize
+    # is applied ONLY to the delivered artifacts at the very END (see below). Resizing
+    # the source FIRST turns every text stroke into high frequency -> ELA saturates on
+    # ALL text and the forgery no longer stands out (measured: ratio collapses). Computing
+    # ELA natively THEN downscaling the ELA preserves the contrast — this is exactly what
+    # detection_eval._ela_one does (native ELA -> BILINEAR resize to 384).
+    resize_to = int(ann_cfg["input_res"]) if bool(ann_cfg.get("resize_square", False)) else None
+
     # Working base: source ALWAYS recompressed at q -> establishes the compression
     # history of the "original document" (background double-compressed after the
     # final pass at q). Q0 is still read/logged but is no longer the effective history.
@@ -453,15 +484,12 @@ def _run_job(job: Job, cfg: dict, out_dirs: dict, nonstd_thr: float) -> dict:
     n = 0 if job.is_negative else int(job.n_forgeries)
 
     # ---- SINGLE Q2 pass on the entire composite image (mandatory rule) ----
-    #      -> images/ folder
+    #      -> images/ folder. Saved at NATIVE resolution so the ELA below is computed
+    #      natively (the forensic order); the optional square resize happens AFTER.
     img_path = os.path.join(out_dirs["images"], f"{job.doc_id}.jpg")
     save_q2(edited, img_path, job.q2, subsampling=DEFAULT_Q2_SUBSAMPLING)
 
-    # ---- Exact pixel-level mask -> masks/ folder ----
-    mask_path = os.path.join(out_dirs["masks"], f"{job.stem}_mask_{n}.png")
-    cv2.imwrite(mask_path, mask)
-
-    # ---- ELA (3 qualities -> RGB) on the re-read FINAL JPEG -> ela/ folder ----
+    # ---- ELA (3 qualities -> RGB) on the re-read FINAL JPEG, at NATIVE resolution ----
     ela_cfg = cfg.get("ela", cfg.get("ela_preview", {}))
     ela_center = int(ela_cfg.get("ela_quality", 90))
     ela_spread = int(ela_cfg.get("ela_spread", 8))
@@ -471,6 +499,25 @@ def _run_job(job: Job, cfg: dict, out_dirs: dict, nonstd_thr: float) -> dict:
     ela_gray = bool(ela_cfg.get("grayscale_input", False))
     ela_rgb = compute_ela_stack(img_path, ela_qs, ela_scale,
                                 chroma_suppress=ela_chroma, grayscale_input=ela_gray)
+
+    # ---- Optional square resize of the DELIVERED artifacts, applied AFTER native ELA ----
+    # image: AREA/CUBIC · mask: NEAREST (no new labels) · ELA: BILINEAR (== detection_eval).
+    # Re-saving the resized JPEG adds one compression, so its OWN ELA no longer matches;
+    # the model input is the precomputed ela/ PNG (dataset.csv x_path), which is correct.
+    # bboxes/mask are rescaled so mask, ELA and JSON stay pixel-aligned at (input_res)^2.
+    if resize_to is not None:
+        sx, sy = resize_to / float(src.width), resize_to / float(src.height)
+        save_q2(_resize_square(edited, resize_to), img_path, job.q2,
+                subsampling=DEFAULT_Q2_SUBSAMPLING)
+        mask = cv2.resize(mask, (resize_to, resize_to), interpolation=cv2.INTER_NEAREST)
+        ela_rgb = cv2.resize(ela_rgb, (resize_to, resize_to), interpolation=cv2.INTER_LINEAR)
+        bbox = _scale_bbox(bbox, sx, sy)
+        forgery_bboxes = [_scale_bbox(b, sx, sy) for b in forgery_bboxes]
+
+    # ---- Exact pixel-level mask -> masks/ folder ----
+    mask_path = os.path.join(out_dirs["masks"], f"{job.stem}_mask_{n}.png")
+    cv2.imwrite(mask_path, mask)
+
     ela_path = os.path.join(out_dirs["ela"], f"{job.stem}_ela_{n}.png")
     Image.fromarray(ela_rgb, "RGB").save(ela_path)      # RGB: channels = (q_low, q_mid, q_high)
 
@@ -511,6 +558,7 @@ def _run_job(job: Job, cfg: dict, out_dirs: dict, nonstd_thr: float) -> dict:
 
     # ---- Manifest row ----
     n_mask_px = int((mask > 0).sum())
+    mask_h, mask_w = mask.shape[:2]      # == (input_res)^2 when resized, native otherwise
     return {
         "id": job.doc_id,
         "source_id": src.source_id,
@@ -529,7 +577,7 @@ def _run_job(job: Job, cfg: dict, out_dirs: dict, nonstd_thr: float) -> dict:
         "bbox_w": bbox[2] if bbox else -1,
         "bbox_h": bbox[3] if bbox else -1,
         "n_mask_px": n_mask_px,
-        "mask_frac": round(n_mask_px / (src.width * src.height), 6),
+        "mask_frac": round(n_mask_px / float(mask_w * mask_h), 6),
         "n_pos_patches": int((labels > 0).sum()),
         "subsampling_src": src.subsampling,
         "seed": job.seed,

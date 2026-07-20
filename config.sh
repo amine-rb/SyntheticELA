@@ -28,17 +28,17 @@ NONSTANDARD_ABSDIFF_THRESHOLD=40              # "non-standard quantization table
 
 # ALIGNED (input, output) lists: one corpus per entry, same length (README §2, §8).
 RUN_SOURCE_DIRS=(
-  # "/Users/amine_rb/Desktop/Master IASD/coding/SyntheticEla/data/StaVer/scans/scans"
-  # "/Users/amine_rb/Desktop/Master IASD/coding/SyntheticEla/data/SROIE2019/train/img"
-  # "/Users/amine_rb/Desktop/Master IASD/coding/SyntheticEla/data/NoisyMed/bills"
-  # "/Users/amine_rb/Desktop/Master IASD/coding/SyntheticEla/data/NoisyMed/discharge_summaries"
+  "/Users/amine_rb/Desktop/Master IASD/coding/SyntheticEla/data/StaVer/scans/scans"
+  "/Users/amine_rb/Desktop/Master IASD/coding/SyntheticEla/data/SROIE2019/train/img"
+  "/Users/amine_rb/Desktop/Master IASD/coding/SyntheticEla/data/NoisyMed/bills"
+  "/Users/amine_rb/Desktop/Master IASD/coding/SyntheticEla/data/NoisyMed/discharge_summaries"
   "/Users/amine_rb/Desktop/Master IASD/coding/SyntheticEla/data/Signatures"
 )
 RUN_OUTPUT_DIRS=(
-  # "/Users/amine_rb/Desktop/Master IASD/coding/SyntheticEla/data/StaVer/scans/fraud"
-  # "/Users/amine_rb/Desktop/Master IASD/coding/SyntheticEla/data/SROIE2019/train/fraud"
-  # "/Users/amine_rb/Desktop/Master IASD/coding/SyntheticEla/data/NoisyMed/bills_fraud"
-  # "/Users/amine_rb/Desktop/Master IASD/coding/SyntheticEla/data/NoisyMed/discharge_summaries_fraud"
+  "/Users/amine_rb/Desktop/Master IASD/coding/SyntheticEla/data/StaVer/scans/fraud"
+  "/Users/amine_rb/Desktop/Master IASD/coding/SyntheticEla/data/SROIE2019/train/fraud"
+  "/Users/amine_rb/Desktop/Master IASD/coding/SyntheticEla/data/NoisyMed/bills_fraud"
+  "/Users/amine_rb/Desktop/Master IASD/coding/SyntheticEla/data/NoisyMed/discharge_summaries_fraud"
   "/Users/amine_rb/Desktop/Master IASD/coding/SyntheticEla/data/Signatures/fraud"
 )
 RUN_CORPUS_NAMES=(staver sroie bills discharge)   # `corpus` column names (aligned); () = derived from the path
@@ -66,6 +66,7 @@ NEGATIVES_RATIO=0                            # fraction of authentics/subfolder 
 KEEP_BENIGN_COLORED=true                      # preserve logos/stamps/headers
 
 INPUT_RES=384                                 # input resolution of the downstream model
+RESIZE_384=true                             # true: deliver every doc (forged or not) as INPUT_RESxINPUT_RES (square) -> images/masks/ela model-ready, CSV points to 384x384 files. Resize is applied AFTER the native Q1->Q2 + ELA (ELA computed natively then downscaled, else text saturates). false: keep native size
 PATCH_SIZE=16                                 # patch size
 PATCH_GRID=24                                 # patch grid (24x24)
 PATCH_POSITIVE_OVERLAP=0.5                    # patch positive if overlap > threshold
@@ -73,7 +74,7 @@ PATCH_POSITIVE_OVERLAP=0.5                    # patch positive if overlap > thre
 ELA_N_SAMPLES=50                              # number of QA boards image | ELA | mask
 
 SEED=42                                       # global seed (reproducibility)
-N_DOCS=""                                     # docs PER TYPE and PER corpus; "" = as many as source images (y=x, one forgery/image); else an integer y (y<x = subsample, y>x = sources reused with a different forgery)
+N_DOCS=5                                     # docs PER TYPE and PER corpus; "" = as many as source images (y=x, one forgery/image); else an integer y (y<x = subsample, y>x = sources reused with a different forgery)
 N_WORKERS=4                                   # parallelism
 
 
