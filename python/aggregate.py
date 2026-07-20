@@ -1,31 +1,30 @@
-"""aggregate — Fusionne des sous-dossiers de types en UN sous-dossier unique.
+"""aggregate — Merge type subfolders into ONE single subfolder.
 
-Rôle
+Role
 ----
-L'orchestrator écrit un sous-dossier autonome par type d'édition
-(`<out>/substitution`, `<out>/copy_move`, `<out>/splice`, ...). Ce module les
-réunit en un seul dataset (`<out>/_aggregated` par défaut) sans rien perdre :
+The orchestrator writes a self-contained subfolder per edit type
+(`<out>/substitution`, `<out>/copy_move`, `<out>/splice`, ...). This module
+merges them into a single dataset (`<out>/_aggregated` by default) losing nothing:
 
-    - copie (ou lie) les fichiers `images/<id>.jpg`, `masks/<id>_mask.png`,
-      `masks/<id>.json`, `ela/<id>_ela.png` de chaque type,
-    - concatène les manifestes en un `manifest.parquet` unique (colonne `type`
-      -> re-filtrable par type à volonté) + un CSV par dossier (images/masks/ela),
-    - reprend `distribution.json` (corpus commun) et écrit un `run_config.yaml`
-      agrégé + un `REPORT.md` régénéré.
+    - copies (or links) the `images/<id>.jpg`, `masks/<id>_mask.png`,
+      `masks/<id>.json`, `ela/<id>_ela.png` files of each type,
+    - concatenates the manifests into a single `manifest.parquet` (a `type`
+      column -> re-filterable by type at will) + one CSV per folder (images/masks/ela),
+    - reuses `distribution.json` (shared corpus) and writes an aggregated
+      `run_config.yaml` + a regenerated `REPORT.md`.
 
-Comme les `doc_id` sont préfixés par le type (`substitution_000000`, ...), les
-noms de fichiers ne collisionnent jamais : l'agrégation est un simple `union`.
-Les chemins du manifeste (`images/<id>.jpg`, ...) restent valides tels quels dans
-le dossier agrégé -> aucune réécriture.
+Since the `doc_id`s are prefixed by the type (`substitution_000000`, ...), file
+names never collide: aggregation is a simple `union`. The manifest paths
+(`images/<id>.jpg`, ...) stay valid as-is in the aggregated folder -> no rewrite.
 
 Usage
 -----
-    # tous les sous-dossiers présents :
+    # all present subfolders:
     python aggregate.py --out output
-    # sélection explicite + lien symbolique (pas de copie disque) :
+    # explicit selection + symlink (no disk copy):
     python aggregate.py --out output --types substitution splice --mode symlink
 
-Dépendances : PyArrow, PyYAML.
+Dependencies: PyArrow, PyYAML.
 """
 
 from __future__ import annotations
@@ -44,7 +43,7 @@ _PATH_KEYS = ("path_img", "path_mask", "path_json", "path_ela")
 
 
 def _place(src: str, dst: str, mode: str) -> None:
-    """Dépose `src` en `dst` selon `mode` (copy / symlink / hardlink), idempotent."""
+    """Place `src` at `dst` according to `mode` (copy / symlink / hardlink), idempotent."""
     os.makedirs(os.path.dirname(dst), exist_ok=True)
     if os.path.lexists(dst):
         os.remove(dst)
@@ -57,7 +56,7 @@ def _place(src: str, dst: str, mode: str) -> None:
 
 
 def _discover_types(out_root: str) -> list[str]:
-    """Sous-dossiers contenant un manifeste (hors dossiers agrégés `_*`)."""
+    """Subfolders that contain a manifest (excluding aggregated `_*` folders)."""
     out = []
     for d in sorted(os.listdir(out_root)):
         p = os.path.join(out_root, d)
@@ -69,17 +68,17 @@ def _discover_types(out_root: str) -> list[str]:
 
 def aggregate(out_root: str, types: list[str] | None = None,
               dest: str = "_aggregated", mode: str = "copy") -> str:
-    """Fusionne les sous-dossiers `types` de `out_root` dans `<out_root>/<dest>`."""
+    """Merge the `types` subfolders of `out_root` into `<out_root>/<dest>`."""
     if types is None:
         types = _discover_types(out_root)
     if not types:
         raise RuntimeError(
-            f"Aucun sous-dossier de type avec manifeste sous {out_root} "
-            "(lance d'abord `./scripts/run.sh`).")
+            f"No type subfolder with a manifest under {out_root} "
+            "(run `./scripts/run.sh` first).")
 
     dest_root = os.path.join(out_root, dest)
-    # Les dossiers images/ masks/ ela/ sont créés à la volée par `_place`
-    # (chaque chemin relatif du manifeste y pointe déjà).
+    # The images/ masks/ ela/ folders are created on the fly by `_place`
+    # (each relative manifest path already points into them).
     os.makedirs(dest_root, exist_ok=True)
 
     all_rows: list[dict] = []
@@ -88,7 +87,7 @@ def aggregate(out_root: str, types: list[str] | None = None,
         sub = os.path.join(out_root, t)
         mpath = os.path.join(sub, "manifest.parquet")
         if not os.path.exists(mpath):
-            print(f"  (ignoré : '{t}' sans manifest.parquet)")
+            print(f"  (skipped: '{t}' without manifest.parquet)")
             continue
         rows = pq.read_table(mpath).to_pylist()
         for r in rows:
@@ -104,18 +103,18 @@ def aggregate(out_root: str, types: list[str] | None = None,
         print(f"  + {t}: {len(rows)} docs")
 
     if not all_rows:
-        raise RuntimeError("Rien à agréger (manifestes vides).")
+        raise RuntimeError("Nothing to aggregate (empty manifests).")
 
-    # Manifeste concaténé + un CSV par dossier (images/masks/ela), comme un lot natif.
+    # Concatenated manifest + one CSV per folder (images/masks/ela), like a native batch.
     pq.write_table(pa.Table.from_pylist(all_rows),
                    os.path.join(dest_root, "manifest.parquet"))
     try:
         from orchestrator import write_folder_csvs
         write_folder_csvs(dest_root, all_rows)
     except Exception as exc:
-        print(f"  (CSV par dossier non générés : {type(exc).__name__}: {exc})")
+        print(f"  (per-folder CSVs not generated: {type(exc).__name__}: {exc})")
 
-    # distribution.json (corpus commun) + run_config agrégé.
+    # distribution.json (shared corpus) + aggregated run_config.
     if dist_src:
         shutil.copy2(dist_src, os.path.join(dest_root, "distribution.json"))
     base_cfg = {}
@@ -124,36 +123,36 @@ def aggregate(out_root: str, types: list[str] | None = None,
         base_cfg = yaml.safe_load(open(rc)) or {}
     base_cfg.setdefault("forger", {})
     base_cfg["forger"]["edit_types"] = used_types
-    base_cfg["forger"].pop("edit_type", None)      # plus d'un seul type ici
+    base_cfg["forger"].pop("edit_type", None)      # more than one type here
     base_cfg.setdefault("paths", {})["output_dir"] = dest_root
     base_cfg["_aggregated_from"] = used_types
     with open(os.path.join(dest_root, "run_config.yaml"), "w") as f:
         yaml.safe_dump(base_cfg, f, sort_keys=False, allow_unicode=True)
 
-    # Rapport régénéré sur le lot fusionné.
+    # Report regenerated on the merged batch.
     try:
         import reporter
         reporter.write_report(dest_root)
     except Exception as exc:
-        print(f"  (rapport non généré : {type(exc).__name__}: {exc})")
+        print(f"  (report not generated: {type(exc).__name__}: {exc})")
 
     n_pos = sum(not r["is_negative"] for r in all_rows)
-    print(f"= {dest_root} : {len(all_rows)} docs "
-          f"({n_pos} positifs, {len(all_rows) - n_pos} négatifs), mode={mode}")
+    print(f"= {dest_root}: {len(all_rows)} docs "
+          f"({n_pos} positives, {len(all_rows) - n_pos} negatives), mode={mode}")
     return dest_root
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(
-        description="aggregate — fusionne les sous-dossiers de types en un seul dataset.")
+        description="aggregate — merge the type subfolders into a single dataset.")
     ap.add_argument("--out", required=True,
-                    help="Racine contenant les sous-dossiers de types (ex. output).")
+                    help="Root containing the type subfolders (e.g. output).")
     ap.add_argument("--types", nargs="*", default=None,
-                    help="Types à fusionner (défaut : tous ceux trouvés).")
+                    help="Types to merge (default: all those found).")
     ap.add_argument("--dest", default="_aggregated",
-                    help="Nom du sous-dossier fusionné (défaut : _aggregated).")
+                    help="Name of the merged subfolder (default: _aggregated).")
     ap.add_argument("--mode", choices=["copy", "symlink", "hardlink"], default="copy",
-                    help="copy (portable, défaut) | symlink/hardlink (sans doubler le disque).")
+                    help="copy (portable, default) | symlink/hardlink (without doubling disk).")
     args = ap.parse_args()
     aggregate(args.out, args.types, dest=args.dest, mode=args.mode)
 

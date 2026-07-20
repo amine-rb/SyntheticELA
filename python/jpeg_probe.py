@@ -1,34 +1,34 @@
-"""jpeg_probe — Module 1 du pipeline de génération synthétique.
+"""jpeg_probe — Module 1 of the synthetic generation pipeline.
 
-Rôle
+Role
 ----
-Lire, sur un dossier de JPEG sources (documents Kaggle authentiques), les
-informations de compression *déjà inscrites dans chaque fichier* :
+Read, from a folder of source JPEGs (authentic Kaggle documents), the
+compression information *already inscribed in each file*:
 
-    - Q0 : qualité JPEG estimée depuis la table de quantification (JAMAIS choisie,
-           toujours LUE — cf. instruction.md, règle impérative sur la compression).
-    - table de quantification (luma / chroma).
-    - subsampling chroma (4:4:4 / 4:2:2 / 4:2:0).
+    - Q0: JPEG quality estimated from the quantization table (NEVER chosen,
+          always READ — cf. instruction.md, mandatory rule on compression).
+    - quantization table (luma / chroma).
+    - chroma subsampling (4:4:4 / 4:2:2 / 4:2:0).
     - dimensions.
 
-Le module produit un `distribution.json` caractérisant Q0 sur tout le corpus,
-afin de voir la distribution des qualités AVANT toute génération. Il ne garde
-que les vrais JPEG : une PNG (ou une image sans table de quantification) n'a pas
-de Q0, casserait le mismatch de double compression, et est donc EXCLUE avec log.
+The module produces a `distribution.json` characterizing Q0 over the whole
+corpus, to see the quality distribution BEFORE any generation. It keeps only
+real JPEGs: a PNG (or an image without a quantization table) has no Q0, would
+break the double-compression mismatch, and is therefore EXCLUDED with a log.
 
-Estimation de Q0
-----------------
-Méthode robuste par force brute : pour chaque Q de 1..100 on régénère la table
-standard JPEG (Annexe K + scaling libjpeg) et on retient le Q qui minimise
-l'écart à la table réelle. Validé : pour un JPEG standard, le match est exact.
-Les scanners/téléphones peuvent utiliser des tables custom : on estime quand
-même Q0 mais on le marque `nonstandard` si l'écart dépasse un seuil.
+Q0 estimation
+-------------
+Robust brute-force method: for each Q in 1..100 we regenerate the standard JPEG
+table (Annex K + libjpeg scaling) and keep the Q that minimizes the gap to the
+real table. Validated: for a standard JPEG, the match is exact. Scanners/phones
+may use custom tables: we still estimate Q0 but mark it `nonstandard` if the gap
+exceeds a threshold.
 
-Dépendances : Pillow + NumPy uniquement.
+Dependencies: Pillow + NumPy only.
 
 Usage
 -----
-    python jpeg_probe.py --src /chemin/vers/jpeg_kaggle --out output/distribution.json
+    python jpeg_probe.py --src /path/to/jpeg_kaggle --out output/distribution.json
 """
 
 from __future__ import annotations
@@ -44,8 +44,8 @@ import numpy as np
 from PIL import Image, JpegImagePlugin
 
 # -----------------------------------------------------------------------------
-# Tables de quantification standard JPEG (Annexe K), ordre naturel (row-major).
-# PIL renvoie im.quantization dans ce même ordre naturel (vérifié empiriquement).
+# Standard JPEG quantization tables (Annex K), natural order (row-major).
+# PIL returns im.quantization in this same natural order (verified empirically).
 # -----------------------------------------------------------------------------
 STD_LUMA = np.array([
     16, 11, 10, 16, 24, 40, 51, 61,
@@ -69,9 +69,9 @@ STD_CHROMA = np.array([
     99, 99, 99, 99, 99, 99, 99, 99,
 ], dtype=np.float64)
 
-# Précompute des 100 tables standard scalées (Q = 1..100) pour la force brute.
+# Precompute the 100 scaled standard tables (Q = 1..100) for the brute force.
 def _scaled_table(base: np.ndarray, quality: int) -> np.ndarray:
-    """Table standard scalée à `quality`, façon libjpeg jpeg_quality_scaling."""
+    """Standard table scaled to `quality`, libjpeg jpeg_quality_scaling style."""
     q = max(1, min(100, quality))
     sf = 5000.0 / q if q < 50 else 200.0 - q * 2.0
     t = np.floor((base * sf + 50.0) / 100.0)
@@ -81,14 +81,14 @@ _LUMA_TABLES = {q: _scaled_table(STD_LUMA, q) for q in range(1, 101)}
 
 
 def estimate_quality(qtable: np.ndarray) -> tuple[int, float]:
-    """Estime le facteur qualité d'une table de quantification luma.
+    """Estimate the quality factor of a luma quantization table.
 
     Returns
     -------
     (best_q, absdiff)
-        best_q   : Q dans [1, 100] minimisant l'écart à la table standard.
-        absdiff  : somme des |diff| au meilleur Q (0 = JPEG standard exact).
-                   Sert à décider si la table est "non standard".
+        best_q   : Q in [1, 100] minimizing the gap to the standard table.
+        absdiff  : sum of |diff| at the best Q (0 = exact standard JPEG).
+                   Used to decide whether the table is "non-standard".
     """
     qtable = np.asarray(qtable, dtype=np.float64).reshape(-1)
     best_q, best_err = 100, np.inf
@@ -100,7 +100,7 @@ def estimate_quality(qtable: np.ndarray) -> tuple[int, float]:
 
 
 # -----------------------------------------------------------------------------
-# Enregistrement par fichier
+# Per-file record
 # -----------------------------------------------------------------------------
 @dataclass
 class ProbeRecord:
@@ -108,13 +108,13 @@ class ProbeRecord:
     filename: str
     width: int
     height: int
-    q0: int                 # qualité estimée (luma)
-    absdiff: float          # écart au meilleur Q standard
-    nonstandard: bool       # True si table custom (écart > seuil)
-    n_qtables: int          # nb de tables (1 = luma seule/grayscale, 2 = luma+chroma)
+    q0: int                 # estimated quality (luma)
+    absdiff: float          # gap to the best standard Q
+    nonstandard: bool       # True if custom table (gap > threshold)
+    n_qtables: int          # number of tables (1 = luma only/grayscale, 2 = luma+chroma)
     subsampling: str        # "4:4:4" / "4:2:2" / "4:2:0" / "unknown" / "none"
-    mode: str               # mode PIL (RGB, L, ...)
-    is_lossless: bool = False  # True si source sans compression JPEG (PNG...) : Q0 = -1
+    mode: str               # PIL mode (RGB, L, ...)
+    is_lossless: bool = False  # True if source without JPEG compression (PNG...): Q0 = -1
 
 
 _SUBSAMPLING_LABELS = {0: "4:4:4", 1: "4:2:2", 2: "4:2:0", -1: "unknown"}
@@ -133,18 +133,18 @@ def probe_file(
     nonstandard_threshold: float = 40.0,
     allow_lossless: bool = False,
 ) -> tuple[Optional[ProbeRecord], Optional[str]]:
-    """Sonde un fichier unique.
+    """Probe a single file.
 
     Returns
     -------
-    (record, None) si c'est un vrai JPEG avec table de quantification, OU une
-                   source lossless (PNG...) lorsque `allow_lossless=True` (q0=-1).
-    (None, reason)  si exclu (format non-JPEG sans allow_lossless, illisible).
+    (record, None) if it is a real JPEG with a quantization table, OR a
+                   lossless source (PNG...) when `allow_lossless=True` (q0=-1).
+    (None, reason)  if excluded (non-JPEG format without allow_lossless, unreadable).
 
-    `allow_lossless` : par défaut False (contrat historique : ne garder QUE des
-    JPEG, cf. instruction.md). À True, on garde aussi les sources sans historique
-    JPEG (PNG). Elles n'ont PAS de Q0 : elles ne sont exploitables qu'en mode Q1
-    contrôlé (le Q1 imposé devient l'unique historique de compression du fond).
+    `allow_lossless`: default False (historical contract: keep ONLY JPEGs, cf.
+    instruction.md). When True, we also keep sources without JPEG history (PNG).
+    They have NO Q0: they are usable only with a controlled Q1 (the imposed Q1
+    becomes the background's sole compression history).
     """
     try:
         img = Image.open(path)
@@ -155,7 +155,7 @@ def probe_file(
 
     if img.format != "JPEG" or not quant:
         if allow_lossless:
-            # Source lossless : pas de Q0, marquée is_lossless (Q0 = -1 sentinelle).
+            # Lossless source: no Q0, marked is_lossless (Q0 = -1 sentinel).
             return ProbeRecord(
                 path=os.path.abspath(path), filename=os.path.basename(path),
                 width=img.width, height=img.height, q0=-1, absdiff=0.0,
@@ -164,10 +164,10 @@ def probe_file(
             ), None
         if img.format != "JPEG":
             return None, f"not a JPEG (format={img.format})"
-        # JPEG sans table de quantification -> pas de Q0 exploitable.
+        # JPEG without a quantization table -> no usable Q0.
         return None, "no quantization table"
 
-    # Table luma = index 0 ; c'est celle qui porte le facteur qualité.
+    # Luma table = index 0; it carries the quality factor.
     luma = np.array(quant[0], dtype=np.float64)
     q0, absdiff = estimate_quality(luma)
 
@@ -187,7 +187,7 @@ def probe_file(
 
 
 # -----------------------------------------------------------------------------
-# Parcours de dossier + agrégation
+# Folder walk + aggregation
 # -----------------------------------------------------------------------------
 def _iter_candidates(src: str, recursive: bool, exts: tuple[str, ...]):
     if recursive:
@@ -209,9 +209,9 @@ def probe_dir(
     nonstandard_threshold: float = 40.0,
     allow_lossless: bool = False,
 ) -> dict:
-    """Sonde tout un dossier, retourne un rapport agrégé (dict prêt pour JSON)."""
+    """Probe a whole folder, return an aggregated report (dict ready for JSON)."""
     if not os.path.isdir(src):
-        raise NotADirectoryError(f"source_dir introuvable : {src}")
+        raise NotADirectoryError(f"source_dir not found: {src}")
 
     exts = tuple(e.lower() for e in candidate_ext)
     records: list[ProbeRecord] = []
@@ -228,7 +228,7 @@ def probe_dir(
 
 
 def _build_report(src: str, records: list[ProbeRecord], excluded: list[dict]) -> dict:
-    # Les sources lossless (q0=-1) n'ont pas de Q0 : exclues des stats de Q0.
+    # Lossless sources (q0=-1) have no Q0: excluded from the Q0 stats.
     n_lossless = int(sum(r.is_lossless for r in records))
     q0_values = [r.q0 for r in records if not r.is_lossless]
     summary = {
@@ -249,13 +249,13 @@ def _build_report(src: str, records: list[ProbeRecord], excluded: list[dict]) ->
             "p05": float(np.percentile(arr, 5)),
             "p95": float(np.percentile(arr, 95)),
         }
-        # Histogramme Q0 (bins de 5), trié.
+        # Q0 histogram (bins of 5), sorted.
         hist = Counter((q // 5) * 5 for q in q0_values)
         summary["q0_histogram_bin5"] = {str(k): hist[k] for k in sorted(hist)}
         summary["q0_exact_values"] = {str(k): v for k, v in sorted(Counter(q0_values).items())}
         summary["n_nonstandard_qtables"] = int(sum(r.nonstandard for r in records))
 
-    # Stats indépendantes de Q0 (valables même pour un corpus 100% lossless).
+    # Q0-independent stats (valid even for a 100% lossless corpus).
     if records:
         summary["subsampling_distribution"] = dict(Counter(r.subsampling for r in records))
         dims = np.array([(r.width, r.height) for r in records])
@@ -266,7 +266,7 @@ def _build_report(src: str, records: list[ProbeRecord], excluded: list[dict]) ->
                        "median": float(np.median(dims[:, 1]))},
         }
 
-    # Regroupe les raisons d'exclusion pour lecture rapide.
+    # Group the exclusion reasons for quick reading.
     summary["excluded_reasons"] = dict(Counter(
         e["reason"].split(":")[0].split("(")[0].strip() for e in excluded
     ))
@@ -282,33 +282,33 @@ def _print_summary(report: dict) -> None:
     print("=" * 64)
     print(f"  jpeg_probe — {s['source_dir']}")
     print("=" * 64)
-    print(f"  Sources gardées : {s['n_jpeg_kept']}  (dont lossless/PNG : {s.get('n_lossless_kept', 0)})")
-    print(f"  Exclus        : {s['n_excluded']}  {s.get('excluded_reasons', {})}")
+    print(f"  Sources kept  : {s['n_jpeg_kept']}  (of which lossless/PNG: {s.get('n_lossless_kept', 0)})")
+    print(f"  Excluded      : {s['n_excluded']}  {s.get('excluded_reasons', {})}")
     if s.get("n_lossless_kept", 0) and "dimensions" in s:
-        print(f"  [lossless]    : pas de Q0 (source PNG) -> mode Q1 contrôlé requis.")
+        print(f"  [lossless]    : no Q0 (PNG source) -> controlled Q1 required.")
         print(f"  Dimensions    : W {s['dimensions']['width']}  H {s['dimensions']['height']}")
     if "q0_stats" in s:
         st = s["q0_stats"]
-        print(f"  Q0 (luma)     : min={st['min']} p05={st['p05']} médiane={st['median']} "
-              f"moy={st['mean']} p95={st['p95']} max={st['max']}")
-        print(f"  Q0 histogramme (bins de 5) : {s['q0_histogram_bin5']}")
+        print(f"  Q0 (luma)     : min={st['min']} p05={st['p05']} median={st['median']} "
+              f"mean={st['mean']} p95={st['p95']} max={st['max']}")
+        print(f"  Q0 histogram (bins of 5) : {s['q0_histogram_bin5']}")
         print(f"  Subsampling   : {s['subsampling_distribution']}")
-        print(f"  Tables non standard : {s['n_nonstandard_qtables']} / {s['n_jpeg_kept']}")
+        print(f"  Non-standard tables : {s['n_nonstandard_qtables']} / {s['n_jpeg_kept']}")
         print(f"  Dimensions    : W {s['dimensions']['width']}  H {s['dimensions']['height']}")
     print("=" * 64)
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="jpeg_probe — distribution de Q0 du corpus source.")
-    ap.add_argument("--src", required=True, help="Dossier des JPEG sources (Kaggle authentiques).")
-    ap.add_argument("--out", default="output/distribution.json", help="Chemin du rapport JSON.")
-    ap.add_argument("--no-recursive", action="store_true", help="Ne pas descendre dans les sous-dossiers.")
+    ap = argparse.ArgumentParser(description="jpeg_probe — Q0 distribution of the source corpus.")
+    ap.add_argument("--src", required=True, help="Folder of source JPEGs (authentic Kaggle).")
+    ap.add_argument("--out", default="output/distribution.json", help="Path of the JSON report.")
+    ap.add_argument("--no-recursive", action="store_true", help="Do not descend into subfolders.")
     ap.add_argument("--nonstandard-threshold", type=float, default=40.0,
-                    help="Seuil d'écart (somme |diff|) au-delà duquel une qtable est 'non standard'.")
+                    help="Gap threshold (sum |diff|) beyond which a qtable is 'non-standard'.")
     ap.add_argument("--allow-lossless", action="store_true",
-                    help="Garder aussi les sources lossless (PNG) : q0=-1, exploitables en Q1 contrôlé.")
+                    help="Also keep lossless sources (PNG): q0=-1, usable with a controlled Q1.")
     ap.add_argument("--ext", nargs="*", default=None,
-                    help="Extensions candidates (défaut JPEG ; ajoute .png avec --allow-lossless).")
+                    help="Candidate extensions (default JPEG; adds .png with --allow-lossless).")
     args = ap.parse_args()
 
     exts = tuple(args.ext) if args.ext else (
@@ -326,7 +326,7 @@ def main() -> None:
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     with open(args.out, "w") as f:
         json.dump(report, f, indent=2)
-    print(f"\nRapport écrit : {args.out}  ({len(report['records'])} enregistrements)")
+    print(f"\nReport written: {args.out}  ({len(report['records'])} records)")
 
 
 if __name__ == "__main__":

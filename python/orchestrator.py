@@ -1,38 +1,38 @@
-"""orchestrator — Module 5 du pipeline.
+"""orchestrator — Module 5 of the pipeline.
 
-Rôle
+Role
 ----
-Génération par lot, 100% scriptable, sans intervention manuelle :
-    1. sonde le corpus source (jpeg_probe) et écrit distribution.json,
-    2. planifie N jobs déterministes (seed par document dérivé du seed global),
-       en tirant type d'édition / taille / alignement / Q2 / négatif selon la config,
-    3. exécute (en parallèle) forger -> recompress (passe Q2 unique) -> annotator,
-    4. écrit <id>.jpg, <id>_mask.png, <id>.json + manifest.parquet global.
+Batch generation, 100% scriptable, no manual intervention:
+    1. probes the source corpus (jpeg_probe) and writes distribution.json,
+    2. plans N deterministic jobs (per-document seed derived from the global seed),
+       drawing edit type / size / alignment / Q2 / negative according to the config,
+    3. runs (in parallel) forger -> recompress (single Q2 pass) -> annotator,
+    4. writes <id>.jpg, <id>_mask.png, <id>.json + a global manifest.parquet.
 
-Déterminisme + parallélisme
----------------------------
-Tous les paramètres de chaque job (dont le seed) sont tirés dans le processus
-principal via un RNG maître. Le worker n'utilise que le seed du job pour ses
-choix internes (positions, feather, texte). Le résultat est donc indépendant de
-l'ordre d'exécution des workers.
+Determinism + parallelism
+--------------------------
+All parameters of each job (including the seed) are drawn in the main process
+via a master RNG. The worker uses only the job's seed for its internal choices
+(positions, feather, text). The result is therefore independent of the workers'
+execution order.
 
-Sous-échantillonnage des types / tailles / alignement
------------------------------------------------------
-- Négatifs : proportion `negatives.ratio` (authentiques Q0->Q2, masque vide).
-  Ils empêchent le modèle d'apprendre la double compression GLOBALE au lieu de
-  LOCALISER l'incohérence. Les éléments bénins colorés (logos, tampons) sont
-  conservés par construction : on part de vrais reçus, on ne les retire jamais.
-- Qualité : DEUX passes Q1 < Q2 par document. Q2 (sauvegarde finale, haute) est
-  stratifiée sur le sweep (i % len) ; Q1 = Q2 - q1_gap (base plus basse). La source
-  est recompressée à Q1 (historique du "document original"), la substitution est
-  peinte en pixels NEUFS (jamais vus par Q1), puis sauvegarde finale à Q2 -> le
-  texte authentique porte l'historique Q1->Q2, la zone falsifiée n'a que Q2. En ELA
-  (sondée à une qualité != Q2), la zone ressort du texte ordinaire (~2.6x). L'écart
-  Q1<Q2 est IMPÉRATIF : en Q1==Q2 la falsification est indiscernable (ratio ~1.0).
-- Types / tailles : tirés selon les ratios de la config (tailles équiprobables).
-- Alignement : sur copy_move + splice uniquement, selon `aligned_ratio`.
+Subsampling of types / sizes / alignment
+-----------------------------------------
+- Negatives: proportion `negatives.ratio` (authentic Q0->Q2, empty mask).
+  They prevent the model from learning GLOBAL double compression instead of
+  LOCALIZING the inconsistency. Benign colored elements (logos, stamps) are
+  kept by construction: we start from real receipts and never remove them.
+- Quality: TWO passes Q1 < Q2 per document. Q2 (final save, high) is
+  stratified over the sweep (i % len); Q1 = Q2 - q1_gap (lower base). The source
+  is recompressed at Q1 (history of the "original document"), the substitution is
+  painted in FRESH pixels (never seen by Q1), then a final save at Q2 -> the
+  authentic text carries the Q1->Q2 history, the forged region only has Q2. In ELA
+  (probed at a quality != Q2), the region stands out from ordinary text (~2.6x). The
+  Q1<Q2 gap is MANDATORY: at Q1==Q2 the forgery is indistinguishable (ratio ~1.0).
+- Types / sizes: drawn according to the config ratios (equiprobable sizes).
+- Alignment: on copy_move + splice only, according to `aligned_ratio`.
 
-Dépendances : Pillow, NumPy, OpenCV, PyYAML, PyArrow.
+Dependencies: Pillow, NumPy, OpenCV, PyYAML, PyArrow.
 """
 
 from __future__ import annotations
@@ -42,6 +42,7 @@ import csv
 import io
 import json
 import os
+import re
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, asdict
 from typing import Optional
@@ -64,12 +65,12 @@ _SUBSAMPLING_INT2STR = {0: "4:4:4", 1: "4:2:2", 2: "4:2:0"}
 
 # ------------------------------------------------------------------ ELA + CSV
 def ela_qualities(center: int, spread: int) -> list[int]:
-    """3 qualités de sonde ELA (canaux R,G,B) = (centre-spread, centre, centre+spread).
+    """3 ELA probe qualities (R,G,B channels) = (center-spread, center, center+spread).
 
-    Le centre vise ≈ Q1 (point fixe du fond) pour le contraste max ; l'écart `spread`
-    donne 3 vues décorrélées -> une IMAGE COULEUR dont la teinte encode la réaction
-    différentielle aux 3 sondes (le signal vient de la DIVERSITÉ de qualité, pas de
-    la chroma). Bornées dans [40, 99]. Alimente `detection_eval` mode E2.
+    The center targets ≈ Q1 (the background's fixed point) for maximum contrast; the
+    `spread` gives 3 decorrelated views -> a COLOR IMAGE whose hue encodes the
+    differential reaction to the 3 probes (the signal comes from quality DIVERSITY, not
+    from chroma). Bounded within [40, 99]. Feeds `detection_eval` mode E2.
     """
     return [int(np.clip(center + d, 40, 99)) for d in (-spread, 0, spread)]
 
@@ -77,31 +78,31 @@ def ela_qualities(center: int, spread: int) -> list[int]:
 def compute_ela_stack(img_path: str, qualities: list[int], scale: float,
                       chroma_suppress: float = 0.0,
                       grayscale_input: bool = False) -> np.ndarray:
-    """Pile ELA 3 qualités -> (H, W, 3) uint8 RGB, sur le JPEG FINAL re-lu.
+    """3-quality ELA stack -> (H, W, 3) uint8 RGB, on the re-read FINAL JPEG.
 
-    Canal k = |image - recompress(image, qualities[k])| moyennée sur canaux, à
-    échelle GLOBALE fixe (`scale`), résolution NATIVE (aligné pixel avec image/masque).
-    L'ordre des canaux (R,G,B) = (q_bas, q_moyen, q_haut). Encodeur PIL (cohérent
-    avec `ela_scan` / `detection_eval`). La "couleur" RGB vient de la DIVERSITÉ de
-    qualité (3 sondes), pas de la couleur de l'image -> compatible avec l'entrée gris.
+    Channel k = |image - recompress(image, qualities[k])| averaged over channels, at a
+    fixed GLOBAL scale (`scale`), NATIVE resolution (pixel-aligned with image/mask).
+    The channel order (R,G,B) = (q_low, q_mid, q_high). PIL encoder (consistent
+    with `ela_scan` / `detection_eval`). The RGB "color" comes from quality DIVERSITY
+    (3 probes), not from the image color -> compatible with grayscale input.
 
-    Deux réducteurs de FAUX POSITIFS colorés (logos/tampons/cachets), cumulables :
-    - `grayscale_input` : passe l'image en GRIS AVANT l'ELA. Un logo coloré a des
-      bords énormes PAR CANAL (le canal opposé passe 0<->255) ; en gris ces
-      contrastes se moyennent en une luminance douce -> l'ELA du mobilier coloré
-      CLAIR s'effondre (mesuré 74 -> ~8), la fraude (texte noir) garde ~99 %.
-      Ne suffit pas seul sur le mobilier coloré FONCÉ (reste sombre = contrasté).
-    - `chroma_suppress` > 0 : atténue l'ELA des pixels colorés via un poids
-      w = clip(1 - chroma/seuil, 0, 1) (chroma = distance (Cb,Cr) au gris, mesurée
-      sur l'ORIGINAL couleur même si l'ELA est en gris). Efface le mobilier coloré
-      QUELLE QUE SOIT sa luminosité (chroma > seuil -> w=0). 0 = désactivé.
-    Les deux valides POUR LA SUBSTITUTION (fraude achromatique) ; à désactiver si
-    l'on falsifie une zone colorée.
+    Two colored FALSE-POSITIVE reducers (logos/stamps/seals), cumulable:
+    - `grayscale_input`: converts the image to GRAYSCALE BEFORE ELA. A colored logo has
+      huge PER-CHANNEL edges (the opposite channel swings 0<->255); in grayscale these
+      contrasts average into a soft luminance -> the ELA of LIGHT colored furniture
+      collapses (measured 74 -> ~8), the forgery (black text) keeps ~99%.
+      Not enough on its own for DARK colored furniture (stays dark = contrasted).
+    - `chroma_suppress` > 0: attenuates the ELA of colored pixels via a weight
+      w = clip(1 - chroma/threshold, 0, 1) (chroma = (Cb,Cr) distance to gray, measured
+      on the COLOR ORIGINAL even if the ELA is grayscale). Erases colored furniture
+      WHATEVER its luminosity (chroma > threshold -> w=0). 0 = disabled.
+    Both valid FOR SUBSTITUTION (achromatic forgery); disable if
+    forging a colored region.
     """
-    orig = np.asarray(Image.open(img_path).convert("RGB"), dtype=np.uint8)  # gardé pour la chroma
+    orig = np.asarray(Image.open(img_path).convert("RGB"), dtype=np.uint8)  # kept for chroma
     if grayscale_input:
         g = cv2.cvtColor(orig, cv2.COLOR_RGB2GRAY)
-        img = cv2.cvtColor(g, cv2.COLOR_GRAY2RGB).astype(np.int16)          # 3 canaux gris identiques
+        img = cv2.cvtColor(g, cv2.COLOR_GRAY2RGB).astype(np.int16)          # 3 identical gray channels
     else:
         img = orig.astype(np.int16)
     chans = []
@@ -110,27 +111,42 @@ def compute_ela_stack(img_path: str, qualities: list[int], scale: float,
         Image.fromarray(img.astype(np.uint8), "RGB").save(buf, "JPEG", quality=int(q))
         buf.seek(0)
         rec = np.asarray(Image.open(buf).convert("RGB"), dtype=np.int16)
-        diff = np.abs(img - rec).mean(axis=2)          # ELA luminance à cette qualité
+        diff = np.abs(img - rec).mean(axis=2)          # ELA luminance at this quality
         chans.append(diff)
     ela = np.stack(chans, axis=2).astype(np.float32) * float(scale)
     if chroma_suppress and chroma_suppress > 0:
-        ycc = cv2.cvtColor(orig, cv2.COLOR_RGB2YCrCb).astype(np.float32)    # chroma sur l'ORIGINAL
+        ycc = cv2.cvtColor(orig, cv2.COLOR_RGB2YCrCb).astype(np.float32)    # chroma on the ORIGINAL
         chroma = np.sqrt((ycc[..., 1] - 128.0) ** 2 + (ycc[..., 2] - 128.0) ** 2)
-        w = np.clip(1.0 - chroma / float(chroma_suppress), 0.0, 1.0)        # 1=achroma garde, 0=coloré efface
+        w = np.clip(1.0 - chroma / float(chroma_suppress), 0.0, 1.0)        # 1=achromatic keeps, 0=colored erases
         ela *= w[..., None]
     return np.clip(ela, 0, 255).astype(np.uint8)        # (H, W, 3) RGB
 
 
 def _bn(rel: Optional[str]) -> str:
-    """Nom de fichier depuis un chemin relatif (vide si None)."""
+    """Filename from a relative path (empty if None)."""
     return os.path.basename(rel) if rel else ""
 
 
-def write_folder_csvs(sub_root: str, rows: list[dict]) -> None:
-    """Écrit un CSV par dossier (images / masks / ela) pour faciliter la reprise.
+_STEM_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
-    Chaque CSV est autonome (une ligne par document, nom de fichier + métadonnées
-    utiles) : on peut charger un dossier sans lire le manifeste Parquet global.
+
+def _safe_stem(path: str) -> str:
+    """Clean file stem from a source path (without extension).
+
+    Used as the base for output names ({stem}_{n}.jpg, {stem}_mask_{n}.png, ...):
+    we KEEP the source document name for traceability, only neutralizing the
+    unsafe characters (spaces, encoded accents, /) -> FS + CSV compatible.
+    """
+    stem = os.path.splitext(os.path.basename(path))[0]
+    stem = _STEM_RE.sub("_", stem).strip("_")
+    return stem or "doc"
+
+
+def write_folder_csvs(sub_root: str, rows: list[dict]) -> None:
+    """Writes one CSV per folder (images / masks / ela) to ease loading.
+
+    Each CSV is self-contained (one row per document, filename + useful
+    metadata): a folder can be loaded without reading the global Parquet manifest.
     """
     if not rows:
         return
@@ -156,6 +172,26 @@ def write_folder_csvs(sub_root: str, rows: list[dict]) -> None:
             w.writerow([r["id"], _bn(r.get("path_ela")), _bn(r["path_img"]),
                         r.get("ela_qualities", r.get("ela_quality", "")), r.get("ela_scale", ""),
                         r["is_negative"], r["type"]])
+    # dataset.csv: train/eval-ready index, ABSOLUTE paths -> aggregatable
+    # by simple concatenation across subfolders AND across corpora (self-contained paths).
+    #   id        = sequential integer 0..n-1 SPECIFIC TO THIS dataset.csv (not the file
+    #               stem — that one stays in images.csv/masks.csv/ela.csv/r["id"]
+    #               for matching by filename); not unique once concatenated
+    #               with other subfolders/corpora.
+    #   type      = format of the SOURCE document (png lossless vs jpeg), q0<0 => png
+    #   x_path    = absolute path of the RGB ELA (the model's input X)
+    #   negative  = true (authentic, empty mask) / false (forged)
+    #   mask_path = absolute path of the mask IF forgery, empty otherwise
+    def _abs(sub, rel):
+        return os.path.abspath(os.path.join(sub_root, sub, _bn(rel))) if rel else ""
+    with open(os.path.join(sub_root, "dataset.csv"), "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["id", "type", "x_path", "negative", "mask_path"])
+        for i, r in enumerate(rows):
+            neg = bool(r["is_negative"])
+            src_fmt = "png" if int(r.get("q0", -1)) < 0 else "jpeg"
+            w.writerow([i, src_fmt, _abs("ela", r.get("path_ela")),
+                        str(neg).lower(), "" if neg else _abs("masks", r["path_mask"])])
 
 
 # ------------------------------------------------------------------ job spec
@@ -166,12 +202,13 @@ class Job:
     q2: int
     is_negative: bool
     source_path: str
-    edit_type: Optional[str]        # None si négatif
+    edit_type: Optional[str]        # None if negative
     size_class: Optional[str]
     alignment: Optional[str]
-    donor_path: Optional[str]       # splice uniquement
-    q1: Optional[int] = None        # None = mode natif (Q0 lu) ; sinon Q1 contrôlé
-    n_forgeries: int = 1            # nb de falsifications (même type) sur ce doc positif
+    donor_path: Optional[str]       # splice only
+    q1: Optional[int] = None        # None = native mode (Q0 read); otherwise controlled Q1
+    n_forgeries: int = 1            # number of forgeries (same type) on this positive doc
+    stem: str = ""                  # stem of the SOURCE NAME -> output names {stem}_{n}...
 
 
 # ------------------------------------------------------------------ planning
@@ -179,11 +216,11 @@ KNOWN_EDIT_TYPES = ("substitution", "copy_move", "splice")
 
 
 def resolve_edit_types(cfg: dict) -> list[str]:
-    """Liste ordonnée et dédupliquée des types à générer (un sous-dossier chacun).
+    """Ordered, deduplicated list of types to generate (one subfolder each).
 
-    Source : `forger.edit_types`. Rétro-compat : si absent, dérive de l'ancien
-    `forger.edit_type_ratios` (types à poids > 0). Il n'y a PLUS aucun tirage
-    aléatoire entre types : chaque type est un lot complet et séparé.
+    Source: `forger.edit_types`. Back-compat: if absent, derives from the old
+    `forger.edit_type_ratios` (types with weight > 0). There is NO LONGER any random
+    draw between types: each type is a complete, separate batch.
     """
     fc = cfg.get("forger", {})
     types = fc.get("edit_types")
@@ -192,13 +229,13 @@ def resolve_edit_types(cfg: dict) -> list[str]:
         types = [t for t, w in ratios.items() if w and float(w) > 0]
     if not types:
         raise ValueError(
-            "forger.edit_types est vide : liste au moins un type parmi "
+            "forger.edit_types is empty: list at least one type among "
             f"{list(KNOWN_EDIT_TYPES)}.")
     unknown = [t for t in types if t not in KNOWN_EDIT_TYPES]
     if unknown:
         raise ValueError(
-            f"forger.edit_types contient des types inconnus {unknown} ; "
-            f"connus : {list(KNOWN_EDIT_TYPES)}.")
+            f"forger.edit_types contains unknown types {unknown}; "
+            f"known: {list(KNOWN_EDIT_TYPES)}.")
     seen, ordered = set(), []
     for t in types:
         if t not in seen:
@@ -208,12 +245,12 @@ def resolve_edit_types(cfg: dict) -> list[str]:
 
 
 def parse_gap_range(cfg: dict) -> tuple[int, int]:
-    """(gap_min, gap_max) depuis compression.q1_gap (scalaire OU [min, max]).
+    """(gap_min, gap_max) from compression.q1_gap (scalar OR [min, max]).
 
-    OPTION A (robustesse au Q1 d'inférence) : un gap tiré PAR DOCUMENT dans
-    [min, max] fait varier Q1 = Q2 - gap sur une PLAGE -> le modèle ne surapprend
-    pas un Q1 unique (ex. 67) et généralise à des documents dont la qualité de base
-    diffère. gap_min == gap_max -> Q1 (quasi) fixe = ancien comportement.
+    OPTION A (robustness to the inference Q1): a gap drawn PER DOCUMENT in
+    [min, max] makes Q1 = Q2 - gap vary over a RANGE -> the model does not overfit
+    a single Q1 (e.g. 67) and generalizes to documents whose base quality
+    differs. gap_min == gap_max -> (quasi) fixed Q1 = the old behavior.
     """
     g = cfg["compression"].get("q1_gap", 0)
     if isinstance(g, (list, tuple)):
@@ -223,77 +260,102 @@ def parse_gap_range(cfg: dict) -> tuple[int, int]:
     gmax = max(gmin, gmax)
     if gmin <= 0:
         raise ValueError(
-            "compression.q1_gap doit être > 0 : sans écart Q1<Q2, la substitution "
-            "est indiscernable du texte authentique en ELA (aucun signal exploitable).")
+            "compression.q1_gap must be > 0: without a Q1<Q2 gap, the substitution "
+            "is indistinguishable from authentic text in ELA (no exploitable signal).")
     return gmin, gmax
 
 
 def plan_jobs(cfg: dict, source_paths: list[str], edit_type: str,
               doc_prefix: str, type_index: int = 0) -> list[Job]:
-    """Jobs déterministes pour UN SEUL type d'édition (un sous-dossier).
+    """Deterministic jobs for a SINGLE edit type (one subfolder).
 
-    Chaque type reçoit un flux aléatoire décorrélé (seed `[seed, type_index]`) :
-    négatifs et sources tirés diffèrent d'un type à l'autre -> aucun doublon exact
-    entre sous-dossiers lors de l'agrégation. Les doc_id sont préfixés par
-    `doc_prefix` -> uniques globalement -> agrégation sans collision.
+    Each type gets a decorrelated random stream (seed `[seed, type_index]`):
+    the drawn negatives and sources differ from one type to another -> no exact duplicate
+    between subfolders when aggregating. The doc_ids are prefixed with
+    `doc_prefix` -> globally unique -> aggregation without collision.
     """
     master = np.random.default_rng([int(cfg["orchestrator"]["seed"]), int(type_index)])
-    n_docs = int(cfg["orchestrator"]["n_docs"])
-    # DEUX qualités par document : Q2 (sauvegarde FINALE, tirée du sweep, haute) et
-    # Q1 = Q2 - q1_gap (base de compression du "document original", plus basse).
-    # C'est l'ÉCART Q1<Q2 qui rend la substitution détectable : le texte authentique
-    # porte l'historique Q1->Q2, la zone peinte en pixels NEUFS n'a que Q2 -> en ELA
-    # (sondée à une qualité != Q2) elle ressort du texte ordinaire (~2.6x). En Q1==Q2
-    # la falsification serait indiscernable du texte authentique (mesuré : ratio ~1.0).
+    n_docs_cfg = cfg["orchestrator"]["n_docs"]
+    # None/empty => as many documents as source images (y = x), one per source.
+    n_docs = len(source_paths) if n_docs_cfg is None else int(n_docs_cfg)
+    # TWO qualities per document: Q2 (FINAL save, drawn from the sweep, high) and
+    # Q1 = Q2 - q1_gap (compression base of the "original document", lower).
+    # It is the Q1<Q2 GAP that makes the substitution detectable: the authentic text
+    # carries the Q1->Q2 history, the region painted in FRESH pixels only has Q2 -> in ELA
+    # (probed at a quality != Q2) it stands out from ordinary text (~2.6x). At Q1==Q2
+    # the forgery would be indistinguishable from authentic text (measured: ratio ~1.0).
     quality_sweep = [int(q) for q in cfg["compression"]["quality_sweep"]]
     if not quality_sweep:
         raise ValueError(
-            "compression.quality_sweep est vide : liste au moins une qualité JPEG.")
-    gap_min, gap_max = parse_gap_range(cfg)   # OPTION A : gap (donc Q1) variable par doc
+            "compression.quality_sweep is empty: list at least one JPEG quality.")
+    gap_min, gap_max = parse_gap_range(cfg)   # OPTION A: gap (hence Q1) varies per doc
     neg_ratio = float(cfg["negatives"]["ratio"])
     aligned_ratio = float(cfg["forger"]["aligned_ratio"])
-    # size_classes ORDONNÉES du plus petit au plus grand (ordre du config).
+    # size_classes ORDERED from smallest to largest (config order).
     size_classes = list(cfg["size_classes"].keys())
-    # Nombre de falsifications par doc positif : k ~ U{n_min..n_max} (même type).
+    # Number of forgeries per positive doc: k ~ U{n_min..n_max} (same type).
     n_min, n_max = (list(cfg["forger"].get("n_forgeries", [1, 1])) + [1])[:2]
     n_min, n_max = int(n_min), int(max(int(n_min), int(n_max)))
 
+    # Assignment of sources WITHOUT REPLACEMENT if the corpus is large enough (each source
+    # doc used at most once -> unique output stems, 1:1 traceability). With replacement
+    # only if n_docs > corpus size (the deduplication guard below then makes the
+    # names unique via a suffix).
+    n_src = len(source_paths)
+    if n_docs <= n_src:
+        order = master.permutation(n_src)
+        doc_sources = [source_paths[int(order[i])] for i in range(n_docs)]
+    else:
+        doc_sources = [str(master.choice(source_paths)) for _ in range(n_docs)]
+    used_ids: set[str] = set()      # guarantees unique filenames within the batch
+
     jobs: list[Job] = []
     for i in range(n_docs):
-        # Seed déterministe par document (indépendant du planning des workers).
+        # Deterministic per-document seed (independent of the workers' scheduling).
         seed = int(master.integers(0, 2**31 - 1))
         jrng = np.random.default_rng(seed)
 
-        # Q2 STRATIFIÉE sur le sweep (i % len) -> couverture déterministe et
-        # équilibrée. Q1 = Q2 - gap (borné >= 40 : reste une JPEG valide). Le MÊME
-        # couple (Q1, Q2) est appliqué aux positifs COMME aux négatifs (aucune fuite
-        # qualité globale -> le modèle doit LOCALISER l'écart, pas le lire au niveau page).
+        # Q2 STRATIFIED over the sweep (i % len) -> deterministic and
+        # balanced coverage. Q1 = Q2 - gap (bounded >= 40: stays a valid JPEG). The SAME
+        # (Q1, Q2) pair is applied to positives AS WELL AS negatives (no global
+        # quality leak -> the model must LOCALIZE the gap, not read it at page level).
         q2 = int(quality_sweep[i % len(quality_sweep)])
-        # OPTION A : gap tiré PAR DOC (jrng, déterministe) -> Q1 = Q2 - gap varie sur
-        # [min(sweep)-gap_max, max(sweep)-gap_min]. MÊME tirage pour positifs ET
-        # négatifs -> pas de fuite de qualité au niveau page, le modèle doit localiser.
+        # OPTION A: gap drawn PER DOC (jrng, deterministic) -> Q1 = Q2 - gap varies over
+        # [min(sweep)-gap_max, max(sweep)-gap_min]. SAME draw for positives AND
+        # negatives -> no page-level quality leak, the model must localize.
         gap = int(jrng.integers(gap_min, gap_max + 1))
         q1 = max(40, q2 - gap)
-        source_path = str(master.choice(source_paths))
+        source_path = doc_sources[i]
         is_negative = bool(master.random() < neg_ratio)
-        # Nommage HONNÊTE : un négatif n'est PAS une falsification du type courant.
-        # Il porte le marqueur `authentic` (mais garde le préfixe du dossier pour
-        # rester unique à l'agrégation) -> plus de "substitution_XXXX" à masque vide.
-        doc_id = (f"{doc_prefix}_authentic_{i:06d}" if is_negative
-                  else f"{doc_prefix}_{i:06d}")
+
+        # Number of forgeries on this doc (0 if negative): goes into the
+        # FILENAME (user request). k>=1 for a positive -> size cap.
+        k = 0 if is_negative else int(jrng.integers(n_min, n_max + 1))
+
+        # OUTPUT NAMES = stem of the SOURCE file + number of forgeries, for
+        # source-doc -> artifacts traceability:
+        #   image {stem}_{k}.jpg | mask {stem}_mask_{k}.png | ELA {stem}_ela_{k}.png
+        # doc_id == stem of the image (= {stem}_{k}) -> consistent with detection_eval.
+        # (The `doc_prefix`/type stays carried by the subfolder + the `type` column.)
+        base_stem = _safe_stem(source_path)
+        stem = base_stem
+        d = 1
+        while f"{stem}_{k}" in used_ids:        # source reused (with replacement) -> suffix
+            d += 1
+            stem = f"{base_stem}_{d}"
+        used_ids.add(f"{stem}_{k}")
+        doc_id = f"{stem}_{k}"
 
         if is_negative:
             jobs.append(Job(
                 doc_id=doc_id, seed=seed, q2=q2, is_negative=True,
                 source_path=source_path, edit_type=None, size_class=None,
-                alignment=None, donor_path=None, q1=q1,
+                alignment=None, donor_path=None, q1=q1, n_forgeries=0, stem=stem,
             ))
             continue
 
-        # Nombre de falsifications sur ce doc, puis PLAFOND de taille selon k :
-        # plus il y en a, plus elles sont petites (évite de couvrir toute la page).
-        #   k=1 -> toutes tailles ... k>=len(classes) -> small only.
-        k = int(jrng.integers(n_min, n_max + 1))
+        # SIZE CAP based on k: the more there are, the smaller they are (avoids
+        # covering the whole page). k=1 -> all sizes ... k>=len(classes) -> small only.
         max_idx = min(len(size_classes) - 1, max(0, len(size_classes) - k))
         size_class = str(size_classes[int(jrng.integers(0, max_idx + 1))])
 
@@ -304,21 +366,21 @@ def plan_jobs(cfg: dict, source_paths: list[str], edit_type: str,
             alignment = "aligned" if jrng.random() < aligned_ratio else "misaligned"
             donor_path = None
             if edit_type == "splice":
-                # Splice intra-corpus : autre document du lot.
+                # Intra-corpus splice: another document from the batch.
                 others = [p for p in source_paths if p != source_path] or source_paths
                 donor_path = str(master.choice(others))
 
         jobs.append(Job(
             doc_id=doc_id, seed=seed, q2=q2, is_negative=False,
             source_path=source_path, edit_type=edit_type, size_class=size_class,
-            alignment=alignment, donor_path=donor_path, q1=q1, n_forgeries=k,
+            alignment=alignment, donor_path=donor_path, q1=q1, n_forgeries=k, stem=stem,
         ))
     return jobs
 
 
 # ------------------------------------------------------------------ worker
 def _run_job(job: Job, cfg: dict, out_dirs: dict, nonstd_thr: float) -> dict:
-    """Exécute un job complet : forge -> passe Q2 unique -> annotation -> écriture."""
+    """Runs a full job: forge -> single Q2 pass -> annotation -> write."""
     rng = np.random.default_rng(job.seed)
     allow_lossless = bool(cfg["probe"].get("allow_lossless", False))
     src = decode_source(job.source_path, nonstd_thr, allow_lossless=allow_lossless)
@@ -326,9 +388,9 @@ def _run_job(job: Job, cfg: dict, out_dirs: dict, nonstd_thr: float) -> dict:
     q2_sub_str = _SUBSAMPLING_INT2STR.get(DEFAULT_Q2_SUBSAMPLING, "4:2:0")
     ann_cfg = cfg["annotator"]
 
-    # Base de travail : source TOUJOURS recompressée à q -> établit l'historique
-    # de compression du "document original" (fond double-compressé après la passe
-    # finale à q). Q0 reste lu/journalisé mais n'est plus l'historique effectif.
+    # Working base: source ALWAYS recompressed at q -> establishes the compression
+    # history of the "original document" (background double-compressed after the
+    # final pass at q). Q0 is still read/logged but is no longer the effective history.
     base_rgb = recompress_to_q1(src.rgb, job.q1, subsampling=DEFAULT_Q2_SUBSAMPLING)
     q1_effective = job.q1
 
@@ -343,28 +405,28 @@ def _run_job(job: Job, cfg: dict, out_dirs: dict, nonstd_thr: float) -> dict:
         feather_range = tuple(cfg["forger"]["feather_radius_px"])
         donor_rgb, donor_id, donor_q = None, None, None
         if job.edit_type == "splice":
-            # Le splice insère une région à historique de compression ÉTRANGER.
+            # The splice inserts a region with a FOREIGN compression history.
             donor = decode_source(job.donor_path, nonstd_thr, allow_lossless=allow_lossless)
             donor_rgb, donor_id = donor.rgb, donor.source_id
             if donor.q0 == -1:
-                # Donneur lossless (PNG) : sans ça la région n'aurait AUCUN historique
-                # JPEG et se confondrait avec une substitution. On lui impose une
-                # qualité étrangère Q_donor (tirée dans quality_sweep) -> vraie grille étrangère.
+                # Lossless donor (PNG): without this the region would have NO JPEG
+                # history and would blend in with a substitution. We impose a
+                # foreign quality Q_donor (drawn from quality_sweep) -> a real foreign grid.
                 q_choices = [int(q) for q in cfg["compression"].get("quality_sweep", [job.q2])]
                 donor_q = int(rng.choice(q_choices or [job.q2]))
                 donor_rgb = recompress_to_q1(donor_rgb, donor_q, subsampling=DEFAULT_Q2_SUBSAMPLING)
-            # (donneur JPEG : historique natif Q0 conservé, déjà étranger au fond.)
-        # int (carré) ou [largeur_min, hauteur_min] ; normalisé dans forger.forge().
+            # (JPEG donor: native Q0 history kept, already foreign to the background.)
+        # int (square) or [min_width, min_height]; normalized in forger.forge().
         min_region_px = cfg["forger"].get("min_region_px", forger_mod.JPEG_BLOCK)
-        # Lever 1 : placement sur du contenu réel (encre) plutôt que dans le vide.
+        # Lever 1: placement on real content (ink) rather than in the void.
         on_content = bool(cfg["forger"].get("place_on_content", False))
         min_content_frac = float(cfg["forger"].get("min_content_frac", 0.0))
-        # Fraction des substitutions rendues en COULEUR (0 = tout noir).
+        # Fraction of substitutions rendered in COLOR (0 = all black).
         color_prob = float(cfg["forger"].get("subst_color_prob", 0.0))
 
-        # ---- k falsifications (MÊME type, MÊME classe de taille) accumulées ----
-        # Chaque passe édite l'image courante et évite les zones déjà falsifiées
-        # (forbid). Le masque final est l'UNION des k empreintes.
+        # ---- k forgeries (SAME type, SAME size class) accumulated ----
+        # Each pass edits the current image and avoids the already-forged zones
+        # (forbid). The final mask is the UNION of the k footprints.
         edited = base_rgb
         mask = np.zeros((src.height, src.width), dtype=np.uint8)
         forge_res = None
@@ -380,22 +442,26 @@ def _run_job(job: Job, cfg: dict, out_dirs: dict, nonstd_thr: float) -> dict:
             )
             edited = forge_res.image
             mask = np.maximum(mask, forge_res.mask)
-            forgery_bboxes.append(forge_res.bbox)      # évite le chevauchement suivant
+            forgery_bboxes.append(forge_res.bbox)      # avoids the next overlap
         if donor_q is not None:
-            forge_res.extra["donor_q"] = donor_q   # qualité JPEG étrangère du splice
+            forge_res.extra["donor_q"] = donor_q   # foreign JPEG quality of the splice
         edit_type, size_class, alignment = job.edit_type, job.size_class, job.alignment
-        bbox = ann.bbox_from_mask(mask)            # bbox englobante de l'UNION
+        bbox = ann.bbox_from_mask(mask)            # bounding box of the UNION
 
-    # ---- Passe Q2 UNIQUE sur l'image composite entière (règle impérative) ----
-    #      -> dossier images/
+    # Output names = stem of the SOURCE file + number of forgeries (0 if negative).
+    #   image {stem}_{n}.jpg (== doc_id) | mask {stem}_mask_{n}.png | ELA {stem}_ela_{n}.png
+    n = 0 if job.is_negative else int(job.n_forgeries)
+
+    # ---- SINGLE Q2 pass on the entire composite image (mandatory rule) ----
+    #      -> images/ folder
     img_path = os.path.join(out_dirs["images"], f"{job.doc_id}.jpg")
     save_q2(edited, img_path, job.q2, subsampling=DEFAULT_Q2_SUBSAMPLING)
 
-    # ---- Masque pixel-level exact -> dossier masks/ ----
-    mask_path = os.path.join(out_dirs["masks"], f"{job.doc_id}_mask.png")
+    # ---- Exact pixel-level mask -> masks/ folder ----
+    mask_path = os.path.join(out_dirs["masks"], f"{job.stem}_mask_{n}.png")
     cv2.imwrite(mask_path, mask)
 
-    # ---- ELA (3 qualités -> RGB) sur le JPEG FINAL re-lu -> dossier ela/ ----
+    # ---- ELA (3 qualities -> RGB) on the re-read FINAL JPEG -> ela/ folder ----
     ela_cfg = cfg.get("ela", cfg.get("ela_preview", {}))
     ela_center = int(ela_cfg.get("ela_quality", 90))
     ela_spread = int(ela_cfg.get("ela_spread", 8))
@@ -405,17 +471,17 @@ def _run_job(job: Job, cfg: dict, out_dirs: dict, nonstd_thr: float) -> dict:
     ela_gray = bool(ela_cfg.get("grayscale_input", False))
     ela_rgb = compute_ela_stack(img_path, ela_qs, ela_scale,
                                 chroma_suppress=ela_chroma, grayscale_input=ela_gray)
-    ela_path = os.path.join(out_dirs["ela"], f"{job.doc_id}_ela.png")
-    Image.fromarray(ela_rgb, "RGB").save(ela_path)      # RGB : canaux = (q_bas, q_moyen, q_haut)
+    ela_path = os.path.join(out_dirs["ela"], f"{job.stem}_ela_{n}.png")
+    Image.fromarray(ela_rgb, "RGB").save(ela_path)      # RGB: channels = (q_low, q_mid, q_high)
 
-    # ---- Grille patch 24x24 ----
+    # ---- 24x24 patch grid ----
     labels, fracs = ann.patch_grid_labels(
         mask, input_res=ann_cfg.get("input_res", 384),
         patch_size=ann_cfg["patch_size"], grid=ann_cfg["patch_grid"],
         overlap_thr=ann_cfg["patch_positive_overlap"],
     )
 
-    # ---- Métadonnées JSON ----
+    # ---- JSON metadata ----
     meta = ann.build_metadata(
         doc_id=job.doc_id, source=src, q2=job.q2, edit_type=edit_type,
         size_class=size_class, alignment=alignment, bbox=bbox, seed=job.seed,
@@ -423,27 +489,27 @@ def _run_job(job: Job, cfg: dict, out_dirs: dict, nonstd_thr: float) -> dict:
         grid=ann_cfg["patch_grid"], overlap_thr=ann_cfg["patch_positive_overlap"],
         q2_subsampling=q2_sub_str,
     )
-    meta["Q1_mode"] = "history_gap"            # Q1 < Q2 (écart = signal ELA)
-    meta["Q1_effective"] = int(q1_effective)   # = Q1 (historique de compression du fond)
-    # Multi-falsification : nb de zones + bbox de CHACUNE (le champ `bbox` est
-    # l'englobante de l'union, coarse ; ici la vérité région par région).
+    meta["Q1_mode"] = "history_gap"            # Q1 < Q2 (gap = ELA signal)
+    meta["Q1_effective"] = int(q1_effective)   # = Q1 (compression history of the background)
+    # Multi-forgery: number of zones + bbox of EACH ONE (the `bbox` field is
+    # the bounding box of the union, coarse; here the region-by-region ground truth).
     meta["n_forgeries"] = 0 if job.is_negative else int(job.n_forgeries)
     meta["forgery_bboxes"] = forgery_bboxes
     meta["patch_grid"] = labels.tolist()
     meta["ela"] = {"qualities": ela_qs, "center": ela_center, "spread": ela_spread,
                    "scale": ela_scale, "chroma_suppress": ela_chroma,
                    "grayscale_input": ela_gray,
-                   "channels": "RGB = (q_bas, q_moyen, q_haut)",
+                   "channels": "RGB = (q_low, q_mid, q_high)",
                    "file": os.path.basename(ela_path)}
     meta["files"] = {"image": os.path.basename(img_path),
                      "mask": os.path.basename(mask_path),
                      "ela": os.path.basename(ela_path)}
-    # Le .json accompagne le masque -> dossier masks/.
+    # The .json accompanies the mask -> masks/ folder.
     json_path = os.path.join(out_dirs["masks"], f"{job.doc_id}.json")
     with open(json_path, "w") as f:
         json.dump(meta, f, indent=2)
 
-    # ---- Ligne de manifeste ----
+    # ---- Manifest row ----
     n_mask_px = int((mask > 0).sum())
     return {
         "id": job.doc_id,
@@ -477,19 +543,19 @@ def _run_job(job: Job, cfg: dict, out_dirs: dict, nonstd_thr: float) -> dict:
     }
 
 
-# module-level pour picklabilité (ProcessPoolExecutor).
+# module-level for picklability (ProcessPoolExecutor).
 def _worker(args):
     job, cfg, out_dirs, nonstd_thr = args
     try:
         return _run_job(job, cfg, out_dirs, nonstd_thr)
-    except Exception as exc:  # on isole les échecs par document
+    except Exception as exc:  # isolate per-document failures
         return {"id": job.doc_id, "error": f"{type(exc).__name__}: {exc}"}
 
 
 # ------------------------------------------------------------------ driver
 def _execute_jobs(jobs: list[Job], cfg: dict, out_dirs: dict,
                   nonstd_thr: float, n_workers: int) -> tuple[list, list]:
-    """Exécute une liste de jobs (séquentiel ou parallèle) -> (rows, errors)."""
+    """Runs a list of jobs (sequential or parallel) -> (rows, errors)."""
     rows, errors = [], []
     payloads = [(j, cfg, out_dirs, nonstd_thr) for j in jobs]
     if n_workers <= 1:
@@ -504,7 +570,7 @@ def _execute_jobs(jobs: list[Job], cfg: dict, out_dirs: dict,
 
 
 def _write_batch(sub_root: str, sub_cfg: dict, report: dict, rows: list) -> tuple:
-    """Rend un sous-dossier AUTONOME : distribution + config + manifeste + rapport."""
+    """Makes a subfolder SELF-CONTAINED: distribution + config + manifest + report."""
     with open(os.path.join(sub_root, "distribution.json"), "w") as f:
         json.dump(report, f, indent=2)
     with open(os.path.join(sub_root, "run_config.yaml"), "w") as f:
@@ -512,30 +578,30 @@ def _write_batch(sub_root: str, sub_cfg: dict, report: dict, rows: list) -> tupl
     manifest_path = os.path.join(sub_root, "manifest.parquet")
     if rows:
         pq.write_table(pa.Table.from_pylist(rows), manifest_path)
-        write_folder_csvs(sub_root, rows)     # un CSV par dossier (images/masks/ela)
+        write_folder_csvs(sub_root, rows)     # one CSV per folder (images/masks/ela)
     report_path = None
     try:
         import reporter
         report_path = reporter.write_report(sub_root)
     except Exception as exc:
-        print(f"      (rapport non généré : {type(exc).__name__}: {exc})")
+        print(f"      (report not generated: {type(exc).__name__}: {exc})")
     return manifest_path, report_path
 
 
 def run(cfg: dict, limit: Optional[int] = None, workers: Optional[int] = None) -> dict:
     src_dir = cfg["paths"]["source_dir"]
     if not src_dir:
-        raise ValueError("paths.source_dir est vide : renseigne le dossier des JPEG sources.")
+        raise ValueError("paths.source_dir is empty: set the source JPEG folder.")
     out_root = cfg["paths"]["output_dir"]
     os.makedirs(out_root, exist_ok=True)
 
     nonstd_thr = float(cfg["probe"]["nonstandard_absdiff_threshold"])
-    if limit is not None:  # n_docs PAR TYPE (chaque sous-dossier aura `limit` docs)
+    if limit is not None:  # n_docs PER TYPE (each subfolder will have `limit` docs)
         cfg = {**cfg, "orchestrator": {**cfg["orchestrator"], "n_docs": limit}}
 
-    # 1) Sonde du corpus UNE SEULE FOIS (partagée par tous les types).
+    # 1) Probe the corpus ONCE (shared by all types).
     allow_lossless = bool(cfg["probe"].get("allow_lossless", True))
-    print(f"[1/4] probe sur {src_dir} ...")
+    print(f"[1/4] probe on {src_dir} ...")
     report = jpeg_probe.probe_dir(
         src_dir, recursive=cfg["probe"]["recursive"],
         candidate_ext=tuple(cfg["probe"]["candidate_ext"]),
@@ -544,53 +610,55 @@ def run(cfg: dict, limit: Optional[int] = None, workers: Optional[int] = None) -
     source_paths = [r["path"] for r in report["records"]]
     if not source_paths:
         raise RuntimeError(
-            f"Aucune source image valide dans {src_dir} "
+            f"No valid source image in {src_dir} "
             f"(exts={cfg['probe']['candidate_ext']}, allow_lossless={allow_lossless}).")
     n_lossless = report["summary"].get("n_lossless_kept", 0)
-    print(f"      {len(source_paths)} sources gardées "
-          f"(dont {n_lossless} lossless), {report['summary']['n_excluded']} exclues.")
+    print(f"      {len(source_paths)} sources kept "
+          f"({n_lossless} of them lossless), {report['summary']['n_excluded']} excluded.")
 
-    # Deux passes Q1<Q2 : source recompressée à Q1 (historique du "document
-    # original"), puis sauvegarde finale à Q2 (haute). Les PNG lossless sont gérés
-    # nativement — l'historique vient entièrement de la passe Q1.
+    # Two passes Q1<Q2: source recompressed at Q1 (history of the "original
+    # document"), then final save at Q2 (high). Lossless PNGs are handled
+    # natively — the history comes entirely from the Q1 pass.
     sweep = [int(q) for q in cfg["compression"]["quality_sweep"]]
     gap_min, gap_max = parse_gap_range(cfg)
     ela_cfg = cfg.get("ela", cfg.get("ela_preview", {}))
     ela_q = int(ela_cfg.get("ela_quality", 90))
     ela_spread = int(ela_cfg.get("ela_spread", 8))
-    # PLAGE de Q1 réellement générée (OPTION A : gap tiré par doc) : Q1 = Q2 - gap.
+    # RANGE of Q1 actually generated (OPTION A: gap drawn per doc): Q1 = Q2 - gap.
     q1_lo = max(40, min(sweep) - gap_max)
     q1_hi = max(40, max(sweep) - gap_min)
-    q1_reco = int(round((q1_lo + q1_hi) / 2.0))       # centre de sonde ≈ milieu de la plage Q1
-    channels = ela_qualities(ela_q, ela_spread)       # 3 sondes FIXES = canaux RGB (stratégie d'inférence)
-    # GARDE-FOU DUR : aucune sonde ne doit coïncider avec un Q2 (image au point fixe
-    # de la sonde -> ELA s'effondre à 0, aucune séparabilité).
+    q1_reco = int(round((q1_lo + q1_hi) / 2.0))       # probe center ≈ middle of the Q1 range
+    channels = ela_qualities(ela_q, ela_spread)       # 3 FIXED probes = RGB channels (inference strategy)
+    # HARD GUARD: no probe must coincide with a Q2 (image at the probe's fixed
+    # point -> ELA collapses to 0, no separability).
     clash = sorted(set(channels) & set(sweep))
     if clash:
         raise ValueError(
-            f"Sonde(s) ELA {clash} coïncide(nt) avec QUALITY_SWEEP ({sweep}) : l'ELA "
-            f"s'effondrerait à 0. Garde ELA_QUALITY±ELA_SPREAD hors du sweep "
+            f"ELA probe(s) {clash} coincide(s) with QUALITY_SWEEP ({sweep}): ELA "
+            f"would collapse to 0. Keep ELA_QUALITY±ELA_SPREAD outside the sweep "
             f"(Q1 ∈ [{q1_lo}, {q1_hi}]).")
-    # NB (mesuré, option A) : une sonde FIXE (ex. 59/67/75) reste la meilleure même
-    # quand Q1 varie sur toute la plage — la fraude (Q2 seul) ressort à beaucoup de
-    # qualités de sonde, pas seulement à Q1 pile. Pas besoin d'élargir la sonde ;
-    # c'est la DIVERSITÉ de Q1 dans les données (gap tiré par doc) qui donne la
-    # robustesse au Q1 d'inférence. Alerte seulement si la sonde est absurde.
+    # NB (measured, option A): a FIXED probe (e.g. 59/67/75) stays the best even
+    # when Q1 varies over the whole range — the forgery (Q2 only) shows up at many
+    # probe qualities, not only exactly at Q1. No need to widen the probe;
+    # it is the DIVERSITY of Q1 in the data (gap drawn per doc) that gives
+    # robustness to the inference Q1. Warn only if the probe is absurd.
     if not (40 <= ela_q < min(sweep)):
-        print(f"      ⚠️  ELA_QUALITY={ela_q} hors de [40, {min(sweep)}[ : sonde peu utile.")
-    print(f"      compression : Q2 (sweep) = {sweep}, gap ∈ [{gap_min}, {gap_max}] "
-          f"-> Q1 ∈ [{q1_lo}, {q1_hi}] (tiré par doc) ; sondes ELA (RGB) = {channels}")
+        print(f"      ⚠️  ELA_QUALITY={ela_q} outside [40, {min(sweep)}[ : probe of little use.")
+    print(f"      compression: Q2 (sweep) = {sweep}, gap ∈ [{gap_min}, {gap_max}] "
+          f"-> Q1 ∈ [{q1_lo}, {q1_hi}] (drawn per doc); ELA probes (RGB) = {channels}")
 
-    # Snapshot corpus-level à la racine (référence commune).
+    # Corpus-level snapshot at the root (common reference).
     with open(os.path.join(out_root, "distribution.json"), "w") as f:
         json.dump(report, f, indent=2)
 
-    # 2) Un lot COMPLET ET SÉPARÉ par type d'édition -> un sous-dossier chacun.
+    # 2) One COMPLETE, SEPARATE batch per edit type -> one subfolder each.
     edit_types = resolve_edit_types(cfg)
     n_workers = workers if workers is not None else int(cfg["orchestrator"]["n_workers"])
-    n_per = int(cfg["orchestrator"]["n_docs"])
-    print(f"[2/4] types : {edit_types}  (un sous-dossier chacun, {n_per} docs/type, "
-          f"seed global {cfg['orchestrator']['seed']})")
+    n_docs_cfg = cfg["orchestrator"]["n_docs"]
+    # None/empty => as many documents as source images (y = x).
+    n_per = len(source_paths) if n_docs_cfg is None else int(n_docs_cfg)
+    print(f"[2/4] types: {edit_types}  (one subfolder each, {n_per} docs/type, "
+          f"global seed {cfg['orchestrator']['seed']})")
 
     results = {}
     for ti, etype in enumerate(edit_types):
@@ -601,7 +669,7 @@ def run(cfg: dict, limit: Optional[int] = None, workers: Optional[int] = None) -
                     "ela": os.path.join(sub_root, "ela")}
         for _k in ("images", "masks", "ela"):
             os.makedirs(sub_dirs[_k], exist_ok=True)
-        # Config effective du sous-dossier : self-describing (edit_type scalaire).
+        # Effective config of the subfolder: self-describing (scalar edit_type).
         sub_cfg = {
             **cfg,
             "paths": {**cfg["paths"], "output_dir": sub_root},
@@ -610,17 +678,17 @@ def run(cfg: dict, limit: Optional[int] = None, workers: Optional[int] = None) -
         jobs = plan_jobs(sub_cfg, source_paths, etype, doc_prefix=etype, type_index=ti)
         print(f"[3/4] [{etype}] {len(jobs)} jobs -> {n_workers} worker(s) ...")
         rows, errors = _execute_jobs(jobs, sub_cfg, sub_dirs, nonstd_thr, n_workers)
-        print(f"      [{etype}] {len(rows)} écrits, {len(errors)} erreurs.")
+        print(f"      [{etype}] {len(rows)} written, {len(errors)} errors.")
         for e in errors[:5]:
-            print(f"        ERREUR {e['id']}: {e['error']}")
+            print(f"        ERROR {e['id']}: {e['error']}")
         manifest_path, report_path = _write_batch(sub_root, sub_cfg, report, rows)
         _print_batch_summary(rows)
         results[etype] = {"root": sub_root, "rows": rows, "errors": errors,
                           "manifest": manifest_path, "report": report_path}
 
-    print(f"[4/4] {len(edit_types)} sous-dossier(s) sous {out_root}/ : "
+    print(f"[4/4] {len(edit_types)} subfolder(s) under {out_root}/ : "
           f"{', '.join(edit_types)}")
-    print(f"      Agréger : ./scripts/aggregate.sh")
+    print(f"      Aggregate: ./scripts/aggregate.sh")
     return {"output_dir": out_root, "edit_types": edit_types,
             "distribution": os.path.join(out_root, "distribution.json"),
             "batches": results}
@@ -632,13 +700,13 @@ def _print_batch_summary(rows: list[dict]) -> None:
     from collections import Counter
     print("=" * 64)
     print(f"  Documents      : {len(rows)}")
-    print(f"  Négatifs       : {sum(r['is_negative'] for r in rows)}")
+    print(f"  Negatives      : {sum(r['is_negative'] for r in rows)}")
     print(f"  Types          : {dict(Counter(r['type'] for r in rows))}")
-    print(f"  Alignement     : {dict(Counter(r['alignment'] for r in rows))}")
-    print(f"  Tailles        : {dict(Counter(r['size_class'] for r in rows))}")
+    print(f"  Alignment      : {dict(Counter(r['alignment'] for r in rows))}")
+    print(f"  Sizes          : {dict(Counter(r['size_class'] for r in rows))}")
     pos = [r for r in rows if not r["is_negative"]]
     if pos:
-        print(f"  Falsif./doc    : {dict(sorted(Counter(r['n_forgeries'] for r in pos).items()))}")
+        print(f"  Forgeries/doc  : {dict(sorted(Counter(r['n_forgeries'] for r in pos).items()))}")
     print(f"  Q2             : {dict(Counter(r['q2'] for r in rows))}")
     print("=" * 64)
 
@@ -649,12 +717,12 @@ def load_config(path: str) -> dict:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="orchestrator — génération batch de falsifications synthétiques.")
+    ap = argparse.ArgumentParser(description="orchestrator — batch generation of synthetic forgeries.")
     ap.add_argument("--config", default="config.yaml")
-    ap.add_argument("--src", default=None, help="Écrase paths.source_dir.")
-    ap.add_argument("--out", default=None, help="Écrase paths.output_dir.")
-    ap.add_argument("--n", type=int, default=None, help="Écrase orchestrator.n_docs (utile pour un smoke test).")
-    ap.add_argument("--workers", type=int, default=None, help="Écrase orchestrator.n_workers.")
+    ap.add_argument("--src", default=None, help="Overrides paths.source_dir.")
+    ap.add_argument("--out", default=None, help="Overrides paths.output_dir.")
+    ap.add_argument("--n", type=int, default=None, help="Overrides orchestrator.n_docs (useful for a smoke test).")
+    ap.add_argument("--workers", type=int, default=None, help="Overrides orchestrator.n_workers.")
     args = ap.parse_args()
 
     cfg = load_config(args.config)

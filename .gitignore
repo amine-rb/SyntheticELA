@@ -5,8 +5,7 @@
 # =============================================================================
 
 # --- Données : corpus sources & sorties générées (jamais versionnées) --------
-StaVer/
-SROIE2019/
+data/
 output/
 output_staver/
 # Sorties de génération quel que soit leur emplacement (manifeste, planches QA, cache).
@@ -14,7 +13,6 @@ output_staver/
 **/ela_preview/
 *.parquet
 cache/
-NoisyMed
 
 # --- Python ------------------------------------------------------------------
 __pycache__/
@@ -48,3 +46,4 @@ tmp/
 # --- Notes personnelles (non publiées) ---------------------------------------
 instruction.md
 RAPPORT_STAVER.md
+CLAUDE.md

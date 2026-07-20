@@ -1,17 +1,25 @@
 #!/usr/bin/env bash
-# ela.sh — génère l'ELA RGB (3 qualités ≈ Q1, mêmes paramètres que la génération)
-# sur un dossier d'images quelconque (falsifié ou non), et l'écrit dans un dossier
-# de sortie. Aucun manifeste ni masque requis.
+# ela.sh — ELA RGB (the [COMMON] recipe from config.sh, IDENTICAL to generation) on
+# any image folder (forged or not), WITHOUT recompression: a real forgery already
+# carries its Qa->Qb history; recompressing would mask the signal.
 #
-#   ./scripts/ela.sh --in DOSSIER/IMAGES --out DOSSIER/SORTIE_ELA [--recursive]
+#   ./scripts/ela.sh --in FOLDER/IMAGES --out FOLDER/ELA_OUTPUT [--recursive]
 #   ./scripts/ela.sh --in real_docs/ --out real_docs_ela/ --ela-quality 72
 #
-# Par défaut (sans --in/--out) : ELA du dossier source du config vers OUTPUT_DIR/_ela_scan.
+# Without --in/--out: use the [ELA] defaults from config.sh (ELA_INPUT_DIR /
+# ELA_OUTPUT_DIR / ELA_RECURSIVE), otherwise fall back to the 1st RUN corpus and _ela_scan.
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_common.sh"
 make_config
 
-# Valeurs par défaut pratiques si l'utilisateur ne passe pas --in/--out.
-if [[ "$*" != *"--in"* ]]; then set -- --in "$SOURCE_DIR" "$@"; fi
-if [[ "$*" != *"--out"* ]]; then set -- "$@" --out "$OUTPUT_DIR/_ela_scan"; fi
+# Practical defaults if the user does not pass --in/--out/--recursive.
+if [[ "$*" != *"--in"* ]]; then
+    set -- --in "${ELA_INPUT_DIR:-$SOURCE_DIR}" "$@"
+fi
+if [[ "$*" != *"--out"* ]]; then
+    set -- "$@" --out "${ELA_OUTPUT_DIR:-$OUTPUT_DIR/_ela_scan}"
+fi
+if [[ "${ELA_RECURSIVE:-false}" == "true" && "$*" != *"--recursive"* ]]; then
+    set -- "$@" --recursive
+fi
 
 "$PYTHON" "$PY_DIR/ela_scan.py" --config "$CFG" "$@"

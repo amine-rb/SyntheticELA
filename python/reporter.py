@@ -1,22 +1,22 @@
-"""reporter — Rapport lisible auto-généré par lot (REPORT.md).
+"""reporter — Readable, auto-generated per-batch report (REPORT.md).
 
-Rôle
+Role
 ----
-Après une génération, produire un `REPORT.md` dans le dossier de sortie qui
-explique **les résultats du run** :
-    - source, config effective, qualités (Q1 < Q2, l'écart = signal ELA),
-    - composition du lot (types / tailles / alignement / négatifs / Q),
-    - contrôles d'intégrité (masques positifs/négatifs cohérents),
-    - séparabilité ELA échantillonnée (le signal falsifié ressort-il ?).
+After a generation, produce a `REPORT.md` in the output folder that explains
+**the run's results**:
+    - source, effective config, qualities (Q1 < Q2, the gap = ELA signal),
+    - batch composition (types / sizes / alignment / negatives / Q),
+    - integrity checks (consistent positive/negative masks),
+    - sampled ELA separability (does the forged signal stand out?).
 
-Ce module lit uniquement les artefacts du dossier de sortie (`manifest.parquet`,
-`distribution.json`, `run_config.yaml`) : il peut donc être relancé seul sur un
-lot existant.
+This module reads only the output-folder artifacts (`manifest.parquet`,
+`distribution.json`, `run_config.yaml`): it can therefore be re-run standalone on
+an existing batch.
 
 Usage
 -----
-    python reporter.py --out output              # rapport seul
-    python reporter.py --out output --ela-sample 0   # sans mesure ELA
+    python reporter.py --out output              # report only
+    python reporter.py --out output --ela-sample 0   # without the ELA measurement
 """
 
 from __future__ import annotations
@@ -48,7 +48,7 @@ def _load(out_root: str):
 
 
 def _ela_raw(rgb: np.ndarray, quality: int) -> np.ndarray:
-    """Carte ELA brute (moyenne sur canaux, non normalisée) pour la séparabilité."""
+    """Raw ELA map (channel mean, unnormalized) for the separability."""
     buf = io.BytesIO()
     Image.fromarray(rgb, mode="RGB").save(buf, format="JPEG", quality=int(quality))
     buf.seek(0)
@@ -57,24 +57,24 @@ def _ela_raw(rgb: np.ndarray, quality: int) -> np.ndarray:
 
 
 def _ink_mask(rgb: np.ndarray) -> np.ndarray:
-    """Masque 'encre' (contenu sombre) via Otsu — pour isoler le TEXTE du papier."""
+    """'Ink' mask (dark content) via Otsu — to isolate the TEXT from the paper."""
     gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
     _, binv = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
     return binv > 0
 
 
 def _ela_separability(out_root, rows, quality=90, sample=60):
-    """Séparabilité ELA par type : zone FALSIFIÉE vs TEXTE AUTHENTIQUE.
+    """ELA separability per type: FORGED region vs AUTHENTIC TEXT.
 
-    Métrique qui compte pour un détecteur : `forged / authentic_text`, PAS
-    `in_mask / out_mask`. Ce dernier ne mesure que texte-vs-papier blanc (tout
-    texte a une ELA élevée sur ses bords) -> il est élevé même sans aucun signal
-    de compression, donc trompeur. On compare donc l'ELA du texte falsifié à celle
-    du texte AUTHENTIQUE (encre hors masque, dilaté pour exclure le halo de bord).
-    Ratio >1 = la falsification ressort du texte ordinaire (exploitable) ;
-    ≈1 = indiscernable (aucun signal, cas Q1==Q2).
+    The metric that matters for a detector: `forged / authentic_text`, NOT
+    `in_mask / out_mask`. The latter only measures text-vs-white-paper (any text
+    has high ELA on its edges) -> it is high even without any compression signal,
+    hence misleading. So we compare the forged text's ELA to that of AUTHENTIC
+    text (ink outside the mask, dilated to exclude the edge halo).
+    Ratio >1 = the forgery stands out from ordinary text (usable);
+    ≈1 = indistinguishable (no signal, Q1==Q2 case).
 
-    Renvoie {type: {"fa": [ratios forgé/auth], "fp": [ratios forgé/papier]}}.
+    Returns {type: {"fa": [forged/auth ratios], "fp": [forged/paper ratios]}}.
     """
     pos = [r for r in rows if not r["is_negative"]]
     if not pos or sample <= 0:
@@ -100,8 +100,8 @@ def _ela_separability(out_root, rows, quality=90, sample=60):
         e = _ela_raw(rgb, quality)
         ink = _ink_mask(rgb)
         forged_dil = cv2.dilate(m.astype(np.uint8), kernel) > 0
-        auth_text = ink & (~forged_dil)       # texte authentique (encre hors falsif.)
-        paper = ~ink                          # papier (référence basse)
+        auth_text = ink & (~forged_dil)       # authentic text (ink outside the forgery)
+        paper = ~ink                          # paper (low reference)
         if not auth_text.any():
             continue
         e_forged = float(e[m].mean())
@@ -112,7 +112,7 @@ def _ela_separability(out_root, rows, quality=90, sample=60):
 
 
 def _tbl(header, rows):
-    """Petit tableau Markdown."""
+    """Small Markdown table."""
     out = ["| " + " | ".join(header) + " |",
            "| " + " | ".join("---" for _ in header) + " |"]
     for row in rows:
@@ -123,8 +123,8 @@ def _tbl(header, rows):
 # ---------------------------------------------------------------- rapport
 def write_report(out_root: str, ela_quality: int | None = None, ela_sample: int = 60) -> str:
     rows, dist, cfg = _load(out_root)
-    # Par défaut, mesurer à la qualité de sonde RÉELLE du run (≈ Q1), pas un 90 figé :
-    # sinon le rapport sous-estime le signal (mesuré ailleurs qu'à l'optimum).
+    # By default, measure at the run's ACTUAL probe quality (≈ Q1), not a fixed 90:
+    # otherwise the report underestimates the signal (measured away from the optimum).
     if ela_quality is None:
         ela_quality = int(cfg.get("ela", cfg.get("ela_preview", {})).get("ela_quality", 90)) if cfg else 90
     n = len(rows)
@@ -134,70 +134,70 @@ def write_report(out_root: str, ela_quality: int | None = None, ela_sample: int 
     orch = cfg.get("orchestrator", {}) if cfg else {}
 
     L = []
-    L.append(f"# Rapport de génération — `{out_root}`\n")
-    L.append(f"> Auto-généré par `reporter.py`. {n} documents.\n")
+    L.append(f"# Generation report — `{out_root}`\n")
+    L.append(f"> Auto-generated by `reporter.py`. {n} documents.\n")
 
     # --- 1. Source & config ---
     L.append("## 1. Source & configuration\n")
     src_dir = cfg.get("paths", {}).get("source_dir", "?") if cfg else "?"
     n_lossless = dist.get("n_lossless_kept", 0)
-    src_kind = "lossless (PNG, pas de Q0)" if n_lossless else "JPEG (Q0 lu)"
+    src_kind = "lossless (PNG, no Q0)" if n_lossless else "JPEG (Q0 read)"
     info = [
-        ("Dossier source", src_dir),
-        ("Sources gardées", f"{dist.get('n_jpeg_kept', '?')} (dont lossless : {n_lossless})"),
-        ("Type de source", src_kind),
-        ("Seed global", orch.get("seed", "?")),
-        ("Q2 finale (sweep)", comp.get("quality_sweep", "-")),
-        ("Écart Q1_GAP", f"Q1 = Q2 - {comp.get('q1_gap', '?')}"),
-        ("Compression", "Q1 < Q2 : fond/texte authentique = Q1->Q2 ; substitution = Q2 seul (l'écart = signal ELA)"),
+        ("Source folder", src_dir),
+        ("Sources kept", f"{dist.get('n_jpeg_kept', '?')} (of which lossless: {n_lossless})"),
+        ("Source type", src_kind),
+        ("Global seed", orch.get("seed", "?")),
+        ("Final Q2 (sweep)", comp.get("quality_sweep", "-")),
+        ("Q1_GAP gap", f"Q1 = Q2 - {comp.get('q1_gap', '?')}"),
+        ("Compression", "Q1 < Q2: background/authentic text = Q1->Q2; substitution = Q2 only (the gap = ELA signal)"),
     ]
     if "q0_stats" in dist:
         s = dist["q0_stats"]
-        info.append(("Q0 corpus", f"médiane {s['median']}, [{s['min']}–{s['max']}]"))
+        info.append(("Corpus Q0", f"median {s['median']}, [{s['min']}–{s['max']}]"))
     if "dimensions" in dist:
         d = dist["dimensions"]
         info.append(("Dimensions", f"W {d['width']['min']}–{d['width']['max']}, "
                                     f"H {d['height']['min']}–{d['height']['max']}"))
-    L.append(_tbl(["Champ", "Valeur"], info) + "\n")
+    L.append(_tbl(["Field", "Value"], info) + "\n")
 
     # --- 2. Composition ---
-    L.append("## 2. Composition du lot\n")
-    L.append(_tbl(["Catégorie", "Décompte"], [
+    L.append("## 2. Batch composition\n")
+    L.append(_tbl(["Category", "Count"], [
         ("Total", n),
-        ("Positifs (falsifiés)", len(pos)),
-        ("Négatifs (authentiques)", f"{len(neg)} ({len(neg)/max(n,1)*100:.0f} %)"),
+        ("Positives (forged)", len(pos)),
+        ("Negatives (authentic)", f"{len(neg)} ({len(neg)/max(n,1)*100:.0f} %)"),
     ]) + "\n")
-    L.append("**Types** : " + ", ".join(f"{k} {v}" for k, v in sorted(Counter(r["type"] for r in rows).items())) + "  ")
-    L.append("**Tailles** : " + ", ".join(f"{k} {v}" for k, v in Counter(r["size_class"] for r in rows).items()) + "  ")
-    L.append("**Alignement** : " + ", ".join(f"{k} {v}" for k, v in Counter(r["alignment"] for r in rows).items()) + "  ")
-    L.append("**Q2 (sauvegarde finale)** : " + ", ".join(f"{k}→{v}" for k, v in sorted(Counter(r["q2"] for r in rows).items())) + "\n")
+    L.append("**Types**: " + ", ".join(f"{k} {v}" for k, v in sorted(Counter(r["type"] for r in rows).items())) + "  ")
+    L.append("**Sizes**: " + ", ".join(f"{k} {v}" for k, v in Counter(r["size_class"] for r in rows).items()) + "  ")
+    L.append("**Alignment**: " + ", ".join(f"{k} {v}" for k, v in Counter(r["alignment"] for r in rows).items()) + "  ")
+    L.append("**Q2 (final save)**: " + ", ".join(f"{k}→{v}" for k, v in sorted(Counter(r["q2"] for r in rows).items())) + "\n")
 
-    # --- 3. Intégrité ---
-    L.append("## 3. Contrôles d'intégrité\n")
+    # --- 3. Integrity ---
+    L.append("## 3. Integrity checks\n")
     bad_pos = sum(r["n_mask_px"] == 0 for r in pos)
     bad_neg = sum(r["n_mask_px"] > 0 for r in neg)
     ok = (bad_pos == 0 and bad_neg == 0)
-    L.append(_tbl(["Contrôle", "Résultat"], [
-        ("Positifs à masque vide (attendu 0)", bad_pos),
-        ("Négatifs à masque non vide (attendu 0)", bad_neg),
-        ("Statut global", "✅ OK" if ok else "❌ ANOMALIE"),
+    L.append(_tbl(["Check", "Result"], [
+        ("Positives with empty mask (expected 0)", bad_pos),
+        ("Negatives with non-empty mask (expected 0)", bad_neg),
+        ("Overall status", "✅ OK" if ok else "❌ ANOMALY"),
     ]) + "\n")
     frac = [(sc, [r["mask_frac"] * 100 for r in pos if r["size_class"] == sc]) for sc in
             ["small", "medium", "large", "very_large"]]
-    L.append("Surface falsifiée moyenne par classe de taille :\n")
-    L.append(_tbl(["Classe", "% page (moy)", "n"],
+    L.append("Mean forged area per size class:\n")
+    L.append(_tbl(["Class", "% page (mean)", "n"],
                   [(sc, f"{np.mean(v):.3f}" if v else "-", len(v)) for sc, v in frac]) + "\n")
 
-    # --- 4. Séparabilité ELA ---
-    L.append("## 4. Signal ELA (séparabilité échantillonnée)\n")
+    # --- 4. ELA separability ---
+    L.append("## 4. ELA signal (sampled separability)\n")
     agg, n_used = _ela_separability(out_root, rows, ela_quality, ela_sample)
     if agg:
-        L.append(f"Ratio ELA-Q{ela_quality} de la zone **falsifiée vs texte "
-                 f"AUTHENTIQUE** (échantillon de {n_used} positifs). C'est la métrique "
-                 "qui compte : >1 = la falsification ressort du texte ordinaire "
-                 "(exploitable) ; ≈1 = indiscernable (aucun signal, ex. Q1==Q2). "
-                 "Le ratio *vs papier* est donné pour info (toujours élevé car tout "
-                 "texte s'allume — trompeur seul).\n")
+        L.append(f"ELA-Q{ela_quality} ratio of the **forged region vs AUTHENTIC "
+                 f"text** (sample of {n_used} positives). This is the metric that "
+                 "matters: >1 = the forgery stands out from ordinary text (usable); "
+                 "≈1 = indistinguishable (no signal, e.g. Q1==Q2). "
+                 "The *vs paper* ratio is given for reference (always high because any "
+                 "text lights up — misleading on its own).\n")
         types = sorted(agg) or ["substitution"]
         tbl_rows = []
         for t in types:
@@ -205,29 +205,29 @@ def write_report(out_root: str, ela_quality: int | None = None, ela_sample: int 
             fa_s = f"{np.mean(fa):.2f} (n={len(fa)})" if fa else "-"
             fp_s = f"{np.mean(fp):.2f}" if fp else "-"
             tbl_rows.append([t, fa_s, fp_s])
-        L.append(_tbl(["type", f"forgé/texte-authentique (ELA-Q{ela_quality})",
-                       "forgé/papier (info)"], tbl_rows) + "\n")
+        L.append(_tbl(["type", f"forged/authentic-text (ELA-Q{ela_quality})",
+                       "forged/paper (reference)"], tbl_rows) + "\n")
         best = max((np.mean(agg[t]["fa"]) for t in types if agg[t]["fa"]), default=0.0)
         if best < 1.3:
-            L.append("> ⚠️ **Signal faible** (forgé/authentique < 1.3) : la falsification "
-                     "est peu distinguable du texte réel. Vérifie que Q1 < Q2 (écart "
-                     "`Q1_GAP`) et que `ELA_QUALITY` diffère des Q2 du sweep.\n")
+            L.append("> ⚠️ **Weak signal** (forged/authentic < 1.3): the forgery "
+                     "is hard to distinguish from real text. Check that Q1 < Q2 (the "
+                     "`Q1_GAP` gap) and that `ELA_QUALITY` differs from the sweep's Q2.\n")
     else:
-        L.append("_(mesure ELA désactivée ou aucun positif)_\n")
+        L.append("_(ELA measurement disabled or no positives)_\n")
 
-    # --- 5. Fichiers ---
-    L.append("## 5. Fichiers produits\n")
+    # --- 5. Files ---
+    L.append("## 5. Produced files\n")
     L.append("```\n"
-             f"{out_root}/images/<id>.jpg        # document falsifié (fond double-compressé à Q)\n"
-             f"{out_root}/images/images.csv      # CSV du dossier (reprise facile)\n"
-             f"{out_root}/masks/<id>_mask.png    # masque binaire pixel exact\n"
-             f"{out_root}/masks/<id>.json        # métadonnées + grille patch 24x24\n"
-             f"{out_root}/masks/masks.csv        # CSV du dossier (bboxes, n_mask_px, ...)\n"
-             f"{out_root}/ela/<id>_ela.png       # ELA RGB (3 qualités ≈ Q1) sur le JPEG final\n"
-             f"{out_root}/ela/ela.csv            # CSV du dossier (qualités/échelle ELA)\n"
-             f"{out_root}/manifest.parquet       # table globale\n"
-             f"{out_root}/distribution.json      # sonde du corpus source\n"
-             f"{out_root}/run_config.yaml        # config effective (reproductibilité)\n"
+             f"{out_root}/images/<stem>_<n>.jpg       # forged document (background double-compressed at Q; n = number of forgeries)\n"
+             f"{out_root}/images/images.csv           # folder CSV (easy loading)\n"
+             f"{out_root}/masks/<stem>_mask_<n>.png   # exact pixel binary mask\n"
+             f"{out_root}/masks/<stem>_<n>.json       # metadata + 24x24 patch grid\n"
+             f"{out_root}/masks/masks.csv             # folder CSV (bboxes, n_mask_px, ...)\n"
+             f"{out_root}/ela/<stem>_ela_<n>.png      # ELA RGB (3 qualities ≈ Q1) on the final JPEG\n"
+             f"{out_root}/ela/ela.csv            # folder CSV (ELA qualities/scale)\n"
+             f"{out_root}/manifest.parquet       # global table\n"
+             f"{out_root}/distribution.json      # source-corpus probe\n"
+             f"{out_root}/run_config.yaml        # effective config (reproducibility)\n"
              "```\n")
 
     text = "\n".join(L)
@@ -238,15 +238,15 @@ def write_report(out_root: str, ela_quality: int | None = None, ela_sample: int 
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="reporter — REPORT.md d'un lot généré.")
-    ap.add_argument("--out", required=True, help="Dossier de sortie du lot (contient manifest.parquet).")
+    ap = argparse.ArgumentParser(description="reporter — REPORT.md of a generated batch.")
+    ap.add_argument("--out", required=True, help="Batch output folder (contains manifest.parquet).")
     ap.add_argument("--ela-quality", type=int, default=None,
-                    help="Qualité de sonde ELA pour la séparabilité (défaut : celle du run ≈ Q1).")
+                    help="ELA probe quality for the separability (default: the run's ≈ Q1).")
     ap.add_argument("--ela-sample", type=int, default=60,
-                    help="Nb de positifs échantillonnés pour la séparabilité ELA (0 = désactivé).")
+                    help="Number of positives sampled for the ELA separability (0 = disabled).")
     args = ap.parse_args()
     path = write_report(args.out, ela_quality=args.ela_quality, ela_sample=args.ela_sample)
-    print(f"Rapport écrit : {path}")
+    print(f"Report written: {path}")
 
 
 if __name__ == "__main__":

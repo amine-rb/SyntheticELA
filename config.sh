@@ -1,147 +1,91 @@
 # =============================================================================
-# config.sh — UNIQUE fichier de paramètres du pipeline.
-# =============================================================================
-# Édite CE fichier, puis lance :
-#     ./scripts/run.sh                 # génération (un sous-dossier par type)
-#     ./scripts/aggregate.sh           # fusion des sous-dossiers -> _aggregated/
-#     ./scripts/preview.sh             # planches QA image | ELA | masque
-#
-# Aucun autre fichier à toucher : les scripts .sh génèrent la config interne à
-# partir des variables ci-dessous. Tout override ponctuel se passe en CLI
-# (ex. ./scripts/run.sh --n 500 --workers 8).
+# config.sh — THE single parameter file. Details & rationale: README §7-§8.
+#   ./scripts/run.sh         (multi-corpus generation + merged dataset)
+#   ./scripts/ela.sh         (inference ELA on any image folder)
+#   ./scripts/aggregate.sh   (merge the types of one corpus)
+# Sections: [COMMON] all scripts · [RUN] run.sh · [ELA] ela.sh · [AGGREGATE] aggregate.sh
 # =============================================================================
 
-# --- Chemins -----------------------------------------------------------------
-# SOURCE_DIR="/Users/amine_rb/Desktop/Master IASD/coding/SyntheticEla/StaVer/scans/scans"   # dossier des images sources
-# OUTPUT_DIR="/Users/amine_rb/Desktop/Master IASD/coding/SyntheticEla/StaVer/scans/fraud"   # dossier des images sources
-# SOURCE_DIR="/Users/amine_rb/Desktop/Master IASD/coding/SyntheticEla/SROIE2019/train/img"   # dossier des images sources
-# OUTPUT_DIR="/Users/amine_rb/Desktop/Master IASD/coding/SyntheticEla/SROIE2019/train/fraud"  
-# SOURCE_DIR="/Users/amine_rb/Desktop/Master IASD/coding/SyntheticEla/NoisyMed/bills"   # dossier des images sources
-# OUTPUT_DIR="/Users/amine_rb/Desktop/Master IASD/coding/SyntheticEla/NoisyMed/bills_fraud"    # racine des sorties
-SOURCE_DIR="/Users/amine_rb/Desktop/Master IASD/coding/SyntheticEla/NoisyMed/discharge_summaries"   # dossier des images sources
-OUTPUT_DIR="/Users/amine_rb/Desktop/Master IASD/coding/SyntheticEla/NoisyMed/discharge_summaries_fraud"    # racine des sorties
 
-# --- Sonde du corpus ---------------------------------------------------------
-PROBE_RECURSIVE=true                         # parcourt les sous-dossiers
-CANDIDATE_EXT=(.jpg .jpeg .jpe .jfif .png .tif .tiff .bmp)   # extensions acceptées
-ALLOW_LOSSLESS=true                          # garder PNG/TIFF/BMP (pas de Q0)
-NONSTANDARD_ABSDIFF_THRESHOLD=40             # seuil "qtable non standard"
+# ##################### [COMMON] — run.sh, ela.sh, aggregate.sh ###############
 
-# --- Compression (qualité JPEG UNIQUE par document) --------------------------
-# DEUX passes de qualités DIFFÉRENTES par document (Q1 < Q2). C'est l'écart qui
-# crée le signal ELA de la substitution :
-#   1) recompression de la source à Q1 (qualité MOYENNE) -> "document original"
-#      (fond + texte authentique portent la grille/quantification Q1),
-#   2) substitution peinte en pixels NEUFS (n'a JAMAIS vu Q1),
-#   3) sauvegarde finale de TOUT à Q2 (qualité HAUTE).
-# => Le texte AUTHENTIQUE porte l'historique Q1->Q2 ; la zone falsifiée n'a que Q2.
-#    Sondée en ELA (qualité != Q2), la zone falsifiée RESSORT nettement du texte
-#    ordinaire (mesuré : forgé/authentique ~2.6x). ATTENTION : en Q1==Q2 la
-#    falsification est INDISCERNABLE du texte authentique (ratio ~1.0) -> pas de
-#    signal exploitable. L'écart Q1<Q2 est donc IMPÉRATIF.
-# QUALITY_SWEEP = valeurs de Q2 (sauvegarde FINALE, hautes). Chaque doc en tire une.
-# Elles DOIVENT toutes être != ELA_QUALITY (sinon toute l'image est au point fixe
-# de la sonde et l'ELA s'effondre à 0 partout).
-QUALITY_SWEEP=(90 93 96)
-# Écart de compression : Q1 = Q2 - Q1_GAP (borné >= 40). C'est LE bouton du signal.
-# OPTION A (robustesse au Q1 d'inférence) : Q1_GAP est une PLAGE (min max) -> un gap
-# est tiré PAR DOCUMENT -> Q1 varie sur toute une bande au lieu d'une valeur unique.
-# Le modèle n'apprend donc PAS un Q1 fixe (ex. 67) et généralise à des documents
-# reçus à l'inférence dont la qualité de base diffère. Avec sweep (90 93 96) :
-#   Q1 ∈ [min(sweep)-max_gap, max(sweep)-min_gap] = [90-40, 96-16] = [50, 80].
-# Un scalaire (ex. Q1_GAP=28) reste accepté = Q1 quasi fixe (ancien comportement).
-# Plancher à 20 : sous ~20 le signal est trop faible (mesuré 22->~1.5). Avec sweep
-# (90 93 96) et gap ∈ [20,40] -> Q1 ∈ [90-40, 96-20] = [50, 76].
-Q1_GAP=(20 40)
+PYTHON="${PYTHON:-python}"                    # interpreter (the one that has the deps)
 
-# --- Falsification -----------------------------------------------------------
-# Types à générer : UN SOUS-DOSSIER COMPLET ET SÉPARÉ par type (aucun tirage
-# aléatoire entre types). Ajoute/retire des entrées librement.
-EDIT_TYPES=(substitution)                    # ex. (substitution copy_move splice)
-ALIGNED_RATIO=0.5                            # part alignée grille 8x8 (copy_move + splice)
-FEATHER_RADIUS_PX=(0.5 2.0)                  # adoucissement des bords (anti-tell)
-SPLICE_SOURCE=intra_corpus                   # donneur = autre doc du même corpus
-# Taille MINIMALE garantie du rectangle falsifié : (largeur_min hauteur_min) px,
-# arrondie au multiple de 8 SUPÉRIEUR -> (10 10) garantit >= 16x16. Empêche tout
-# masque à 0 pixel ; une source trop petite échoue proprement (erreur journalisée).
-MIN_REGION_PX=(10 10)
-# Nombre de falsifications PAR DOCUMENT positif : (min max). Chaque doc reçoit
-# k ~ tirage uniforme dans {min..max}, puis k falsifications du MÊME type. Plus k
-# est grand, plus les zones sont PETITES (plafond de taille auto) pour ne pas
-# couvrir toute la page : ex. k=5 -> uniquement des zones "small". (1 1) = une seule.
-N_FORGERIES=(1 5)
-# Placer les falsifications SUR du contenu réel (texte/chiffres) au lieu du vide
-# -> zones réalistes et porteuses de signal ELA (pas d'aplat blanc invisible).
-# MIN_CONTENT_FRAC = fraction min de pixels "encre" visée dans la zone (best-effort ;
-# retombe sur le meilleur emplacement si la page est presque vide).
-PLACE_ON_CONTENT=true
-MIN_CONTENT_FRAC=0.02
-# Couleur de l'encre injectée par la substitution. Fraction des substitutions
-# rendues EN COULEUR (couleur saturée tirée au hasard, différente à chaque fois) ;
-# le reste est en encre sombre (quasi-noire) comme le texte du document.
-#   0.0 = tout en noir (défaut historique)  |  0.5 = moitié couleur / moitié noir.
-# But : que le modèle apprenne à détecter la fraude quelle que soit sa couleur.
-# ATTENTION : une fraude colorée est EFFACÉE par le filtre anti-couleur de l'ELA
-# (ELA_GRAYSCALE_INPUT / ELA_CHROMA_SUPPRESS). Pour détecter les fraudes colorées,
-# METS CE FILTRE À OFF (ELA_GRAYSCALE_INPUT=false, ELA_CHROMA_SUPPRESS=0) et laisse
-# l'autoencodeur gérer les logos via la nouveauté (cf. §7 README).
-SUBST_COLOR_PROB=0.5
+# ELA recipe — MANDATORY: IDENTICAL between generation and inference (README §7).
+ELA_QUALITY=60                                # probe center (channels 52/60/68)
+ELA_SPREAD=8                                  # spread of the 3 RGB channels around the center
+ELA_SCALE=15                                  # fixed global scale (= detection_eval.ELA_SCALE)
+ELA_GRAYSCALE_INPUT=false                     # grayscale before ELA (anti colored-FP; OFF if forging color)
+ELA_CHROMA_SUPPRESS=0                         # erase colored pixels after ELA; 0=off
 
-# --- Classes de taille de zone (fraction de surface page : MIN MAX) ----------
-SIZE_SMALL=(0.001 0.005)                     # ~0.1% – 0.5% de la page
-SIZE_MEDIUM=(0.005 0.02)                     # 0.5% – 2%
-SIZE_LARGE=(0.02 0.06)                       # 2% – 6%
-SIZE_VERY_LARGE=(0.06 0.15)                  # 6% – 15%
+PROBE_RECURSIVE=true                          # probe the corpus subfolders
+CANDIDATE_EXT=(.jpg .jpeg .jpe .jfif .png .tif .tiff .bmp)   # accepted extensions
+ALLOW_LOSSLESS=true                           # keep PNG/TIFF/BMP (no Q0)
+NONSTANDARD_ABSDIFF_THRESHOLD=40              # "non-standard quantization table" threshold
 
-# --- Négatifs (authentiques, masque vide) : part DANS CHAQUE sous-dossier -----
-NEGATIVES_RATIO=0                        # 0.0 = uniquement des falsifications
-KEEP_BENIGN_COLORED=true                     # préserve logos/tampons/en-têtes
 
-# --- Annotation (grille patch pour le modèle en aval) ------------------------
-INPUT_RES=384
-PATCH_SIZE=16
-PATCH_GRID=24
-PATCH_POSITIVE_OVERLAP=0.5                   # patch positif si recouvrement > seuil
+# ##################### [RUN] — run.sh (generation) ##########################
 
-# --- ELA (sortie 1re classe RGB + planches QA) -------------------------------
-# L'ELA de sortie (ela/*.png) est une IMAGE COULEUR RGB : 3 canaux = 3 qualités de
-# sonde (ELA_QUALITY-ELA_SPREAD, ELA_QUALITY, ELA_QUALITY+ELA_SPREAD). La "couleur"
-# vient de la DIVERSITÉ de qualité (pas de la chroma) -> 3 canaux d'info pour le
-# modèle (mode E2 de detection_eval). La zone falsifiée réagit fortement aux 3 sondes.
-#
-# ELA_QUALITY / ELA_SPREAD = sonde FIXE (mêmes 3 qualités pour TOUS les docs, comme à
-# l'inférence où l'on ignore le Q1 du document). Les 3 canaux RGB = (ELA_QUALITY-SPREAD,
-# ELA_QUALITY, ELA_QUALITY+SPREAD), tous DISTINCTS de tout Q2 du sweep (sinon ELA -> 0).
-# IMPORTANT (mesuré, option A) : même quand Q1 varie sur [50,76], une sonde ÉTROITE à
-# 67 reste la MEILLEURE — la fraude (Q2 seul) ressort à beaucoup de qualités, pas
-# seulement à Q1 pile. Inutile d'élargir la sonde ; la robustesse au Q1 d'inférence
-# vient de la DIVERSITÉ de Q1 dans les DONNÉES (Q1_GAP plage), pas de la sonde.
-#   Grille sur données Q1∈[50,80] : 59/67/75 -> moy 2.04 | 57/65/73 -> 1.97 |
-#   53/63/73 -> 1.86 | 55/67/79 -> 1.86 | 50/65/80 -> 1.74. => 67/8 gagne.
-ELA_QUALITY=67                               # sonde fixe optimale (grille) même à Q1 variable
-ELA_SPREAD=8                                 # canaux 59/67/75
-ELA_N_SAMPLES=50                             # nb de planches image | ELA | masque
-# Échelle GLOBALE FIXE de l'ELA d'aperçu (pas d'étirement par max d'image, qui
-# écrasait les fraudes faibles). Aligne-la sur detection_eval.ELA_SCALE (=15).
-ELA_SCALE=15
-# --- Réduction des FAUX POSITIFS colorés (logos/tampons/cachets) --------------
-# Deux leviers CUMULABLES. La substitution est du texte NOIR ; le mobilier
-# authentique coloré brille autant en ELA -> faux positifs. Valides tant que la
-# fraude est achromatique (substitution) ; à désactiver si on falsifie du coloré.
-#
-# 1) Gris AVANT l'ELA : effondre l'ELA du mobilier coloré CLAIR (mesuré 74 -> ~8),
-#    la fraude garde ~99 %. Ne suffit pas seul sur le coloré FONCÉ. true/false.
-ELA_GRAYSCALE_INPUT=false
-# 2) Suppression chroma APRÈS l'ELA : efface les pixels colorés quelle que soit leur
-#    luminosité (chroma > seuil -> 0), donc rattrape le coloré foncé. Seuil ~20 :
-#    logo/tampon -> 0, fraude garde ~87 %. 0 = désactivé.
-ELA_CHROMA_SUPPRESS=0
+# ALIGNED (input, output) lists: one corpus per entry, same length (README §2, §8).
+RUN_SOURCE_DIRS=(
+  # "/Users/amine_rb/Desktop/Master IASD/coding/SyntheticEla/data/StaVer/scans/scans"
+  # "/Users/amine_rb/Desktop/Master IASD/coding/SyntheticEla/data/SROIE2019/train/img"
+  # "/Users/amine_rb/Desktop/Master IASD/coding/SyntheticEla/data/NoisyMed/bills"
+  # "/Users/amine_rb/Desktop/Master IASD/coding/SyntheticEla/data/NoisyMed/discharge_summaries"
+  "/Users/amine_rb/Desktop/Master IASD/coding/SyntheticEla/data/Signatures"
+)
+RUN_OUTPUT_DIRS=(
+  # "/Users/amine_rb/Desktop/Master IASD/coding/SyntheticEla/data/StaVer/scans/fraud"
+  # "/Users/amine_rb/Desktop/Master IASD/coding/SyntheticEla/data/SROIE2019/train/fraud"
+  # "/Users/amine_rb/Desktop/Master IASD/coding/SyntheticEla/data/NoisyMed/bills_fraud"
+  # "/Users/amine_rb/Desktop/Master IASD/coding/SyntheticEla/data/NoisyMed/discharge_summaries_fraud"
+  "/Users/amine_rb/Desktop/Master IASD/coding/SyntheticEla/data/Signatures/fraud"
+)
+RUN_CORPUS_NAMES=(staver sroie bills discharge)   # `corpus` column names (aligned); () = derived from the path
+RUN_FINAL_DATASET_DIR="/Users/amine_rb/Desktop/Master IASD/coding/SyntheticEla/data/_dataset_final"  # "" = no merge
 
-# --- Orchestration -----------------------------------------------------------
-SEED=42                                      # seed global (reproductibilité)
-N_DOCS=20                                  # nb de documents PAR TYPE
-N_WORKERS=4                                  # parallélisme
+QUALITY_SWEEP=(72 78 84 90 96)                # Q2 values (final save, high), drawn per doc
+Q1_GAP=(15 50)                                # Q1 = Q2 - gap; range (min max) => Q1 varies per doc (README §7)
 
-# --- Interpréteur Python (celui qui a les dépendances) -----------------------
-# Laisse "python" si conda/venv est déjà activé. Mets un chemin absolu sinon.
-PYTHON="${PYTHON:-python}"
+EDIT_TYPES=(substitution)                     # one subfolder per type; e.g. (substitution copy_move splice)
+ALIGNED_RATIO=0.5                             # fraction aligned to the 8x8 grid (copy_move + splice)
+FEATHER_RADIUS_PX=(0.5 2.0)                   # edge feathering (anti-tell)
+SPLICE_SOURCE=intra_corpus                    # splice donor = another doc from the same corpus
+MIN_REGION_PX=(10 10)                         # guaranteed min region size (width height), rounded up to x8
+N_FORGERIES=(1 5)                             # number of forgeries per positive doc (min max)
+PLACE_ON_CONTENT=true                         # place forgeries on real content, not blank space
+MIN_CONTENT_FRAC=0.02                         # min ink fraction under a candidate region
+SUBST_COLOR_PROB=0.5                          # fraction of colored substitutions; 0=all black (ELA color filter OFF)
+
+SIZE_SMALL=(0.001 0.005)                      # region: 0.1% – 0.5% of the page
+SIZE_MEDIUM=(0.005 0.02)                      # 0.5% – 2%
+SIZE_LARGE=(0.02 0.06)                        # 2% – 6%
+SIZE_VERY_LARGE=(0.06 0.15)                   # 6% – 15%
+
+NEGATIVES_RATIO=0                            # fraction of authentics/subfolder (high=anomaly train, ~0.5=test)
+KEEP_BENIGN_COLORED=true                      # preserve logos/stamps/headers
+
+INPUT_RES=384                                 # input resolution of the downstream model
+PATCH_SIZE=16                                 # patch size
+PATCH_GRID=24                                 # patch grid (24x24)
+PATCH_POSITIVE_OVERLAP=0.5                    # patch positive if overlap > threshold
+
+ELA_N_SAMPLES=50                              # number of QA boards image | ELA | mask
+
+SEED=42                                       # global seed (reproducibility)
+N_DOCS=""                                     # docs PER TYPE and PER corpus; "" = as many as source images (y=x, one forgery/image); else an integer y (y<x = subsample, y>x = sources reused with a different forgery)
+N_WORKERS=4                                   # parallelism
+
+
+# ##################### [ELA] — ela.sh (inference) ###########################
+# Defaults when --in/--out are absent; "" => 1st RUN corpus and <output>/_ela_scan.
+ELA_INPUT_DIR="/Users/amine_rb/Desktop/Master IASD/coding/SyntheticEla/data/Signatures"                              # folder of docs to analyze
+ELA_OUTPUT_DIR="/Users/amine_rb/Desktop/Master IASD/coding/SyntheticEla/data/Signatures/ela"                             # output folder for the *_ela.png
+ELA_RECURSIVE=true                            # walk the subfolders of --in
+
+
+# ##################### [AGGREGATE] — aggregate.sh (merge the types) ##########
+AGG_OUTPUT_DIR=""                             # corpus to aggregate; "" => RUN_OUTPUT_DIRS[0]
+AGG_TYPES=()                                  # () = all types; e.g. (substitution splice)
+AGG_MODE=copy                                 # copy | symlink | hardlink
+AGG_DEST=_aggregated                          # name of the merged subfolder

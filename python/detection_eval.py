@@ -1,34 +1,33 @@
 """
-Évaluation détection/localisation pour AnoViT — plan §9.3 (seuil), §9.3bis (pilotage), §9.4 (métriques).
+Detection/localization evaluation for AnoViT — plan §9.3 (threshold), §9.3bis (model selection), §9.4 (metrics).
 
-Contenu :
-  - build_ela_cache()        : précalcul ELA -> PNG gris 384 (une fois, hors entraînement)
-  - SyntheticDevDataset      : dev synthétique falsifié (ELA + masque 384, NEAREST)
-  - AuthenticELADataset      : authentiques (pour FPR et Image AUROC), masque = zéros
-  - anomaly_map()            : MAE / MSE / SSIM paramétrable (prépare E4)
-  - evaluate()               : boucle d'inférence -> dict de métriques
+Contents:
+  - build_ela_cache()        : ELA precompute -> grayscale 384 PNG (once, outside training)
+  - SyntheticDevDataset      : synthetic forged dev (ELA + 384 mask, NEAREST)
+  - AuthenticELADataset      : authentics (for FPR and Image AUROC), mask = zeros
+  - anomaly_map()            : configurable MAE / MSE / SSIM (prepares E4)
+  - evaluate()               : inference loop -> dict of metrics
   - pixel_auprc / pixel_auroc / aupro / dice_iou / calibrate_threshold
-  - BestDetectionTracker     : checkpoint best-detection + historique (courbe AUPRC vs époques)
+  - BestDetectionTracker     : best-detection checkpoint + history (AUPRC vs epochs curve)
 
-Dépendances : torch, numpy, pillow, scikit-learn, scipy.
+Dependencies: torch, numpy, pillow, scikit-learn, scipy.
 
-Note layout : la génération écrit désormais les images dans `images/`, les masques
-(+ .json) dans `masks/`, et une ELA RGB pré-calculée dans `ela/` (3 qualités empilées
-en canaux, résolution native). Pour l'entraînement : `build_ela_cache(<...>/images, ...)`
-(cache multi-qualité 384) et `SyntheticDevDataset(<...>/masks, cache, ...)` (1er arg =
-dossier des masques).
+Layout note: generation now writes the images to `images/`, the masks (+ .json) to
+`masks/`, and a precomputed RGB ELA to `ela/` (3 qualities stacked as channels, native
+resolution). For training: `build_ela_cache(<...>/images, ...)` (multi-quality 384
+cache) and `SyntheticDevDataset(<...>/masks, cache, ...)` (1st arg = masks folder).
 
-IMPORTANT — qualités de sonde ELA : viser ≈ Q1 (base du fond = médiane(Q2)−Q1_GAP,
-≈67 avec la config par défaut), PAS 90. Sonder à Q1 met le texte authentique à son
-point fixe (ELA min) et fait exploser la zone falsifiée (mesuré : forgé/auth ~3.2 à
-Q1 vs ~1.8 à Q90). Les 3 qualités E2 encadrent Q1 : (59, 67, 75). Aucune ne doit
-égaler un Q2 du sweep.
+IMPORTANT — ELA probe qualities: aim for ≈ Q1 (background base = median(Q2)−Q1_GAP,
+≈67 with the default config), NOT 90. Probing at Q1 puts authentic text at its fixed
+point (min ELA) and makes the forged region explode (measured: forged/auth ~3.2 at Q1
+vs ~1.8 at Q90). The 3 E2 qualities bracket Q1: (59, 67, 75). None may equal a Q2 from
+the sweep.
 
-Usage (boucle d'entraînement, pilotage §9.3bis) :
+Usage (training loop, model selection §9.3bis):
 
     build_ela_cache("output/images", "cache/dev", qualities=(59, 67, 75))  # ≈ Q1
     dev_ds  = SyntheticDevDataset("output/masks", "cache/dev", qualities=(67,))
-    dev_ds  = pilot_subset(dev_ds, n=400, seed=42)          # sous-échantillon FIXE par époque
+    dev_ds  = pilot_subset(dev_ds, n=400, seed=42)          # FIXED subsample per epoch
     dev_ld  = DataLoader(dev_ds, batch_size=48, num_workers=8, pin_memory=True)
     tracker = BestDetectionTracker("experiments/E0/best_model.pt",
                                    history_path="experiments/E0/auprc_curve.json", patience=15)
@@ -40,10 +39,10 @@ Usage (boucle d'entraînement, pilotage §9.3bis) :
         if tracker.should_stop:
             break
 
-Éval finale (dev complet, suite §9.4) :
+Final eval (full dev, §9.4):
 
     res = evaluate(model, dev_loader_full, error_mode="mae", metrics="full",
-                   authentic_loader=auth_loader)            # seuil calibré sur dev, jamais sur test
+                   authentic_loader=auth_loader)            # threshold calibrated on dev, never on test
     print(res)   # pixel_auprc, aupro, dice, iou, threshold, fpr_authentic, image_auroc, pixel_auroc
 """
 
@@ -64,16 +63,16 @@ from sklearn.metrics import average_precision_score, precision_recall_curve, roc
 from torch.utils.data import Dataset, Subset
 
 # ---------------------------------------------------------------------------
-# 1. Précalcul du cache ELA (une fois, hors entraînement)
+# 1. ELA cache precompute (once, outside training)
 # ---------------------------------------------------------------------------
 
-ELA_SCALE = 15.0  # échelle GLOBALE unique — identique pour tous les splits (jamais par image)
+ELA_SCALE = 15.0  # single GLOBAL scale — identical for all splits (never per image)
 
 
 def _ela_one(args):
     jpg_path, cache_dir, qualities, scale, img_size = args
     doc_id = os.path.splitext(os.path.basename(jpg_path))[0]
-    img = Image.open(jpg_path).convert("RGB")            # résolution NATIVE
+    img = Image.open(jpg_path).convert("RGB")            # NATIVE resolution
     arr = np.asarray(img, np.int16)
     for q in qualities:
         out = os.path.join(cache_dir, f"{doc_id}_q{q}.png")
@@ -82,7 +81,7 @@ def _ela_one(args):
         buf = io.BytesIO()
         img.save(buf, "JPEG", quality=q)
         rec = np.asarray(Image.open(buf), np.int16)
-        ela = np.abs(arr - rec).mean(axis=2)             # RGB -> 1 canal
+        ela = np.abs(arr - rec).mean(axis=2)             # RGB -> 1 channel
         ela = np.clip(ela * scale, 0, 255).astype(np.uint8)
         Image.fromarray(ela, "L").resize((img_size, img_size), Image.BILINEAR).save(out)
     return doc_id
@@ -90,9 +89,9 @@ def _ela_one(args):
 
 def build_ela_cache(data_dir, cache_dir, qualities=(59, 67, 75),
                     scale=ELA_SCALE, img_size=384, workers=8):
-    """ELA à résolution native -> échelle globale fixe -> resize -> PNG gris.
-    Ne JAMAIS sauver en JPEG. Une passe pour les 3 qualités (≈ Q1) = E0/E1 (67) +
-    E2 (59,67,75) servis. Sonder ≈ Q1, pas 90 (cf. en-tête module)."""
+    """ELA at native resolution -> fixed global scale -> resize -> grayscale PNG.
+    NEVER save as JPEG. One pass for the 3 qualities (≈ Q1) serves E0/E1 (67) +
+    E2 (59,67,75). Probe ≈ Q1, not 90 (cf. module header)."""
     os.makedirs(cache_dir, exist_ok=True)
     jpgs = sorted(glob(os.path.join(data_dir, "*.jpg")))
     jobs = [(p, cache_dir, qualities, scale, img_size) for p in jpgs]
@@ -104,13 +103,13 @@ def build_ela_cache(data_dir, cache_dir, qualities=(59, 67, 75),
 
 
 # ---------------------------------------------------------------------------
-# 2. Datasets d'évaluation
+# 2. Evaluation datasets
 # ---------------------------------------------------------------------------
 
 def _load_ela_stack(cache_dir, doc_id, qualities):
-    """(3, H, W) float32 [0,1] — 1 qualité répliquée x3 (E0/E1) ou 3 qualités empilées (E2)."""
+    """(3, H, W) float32 [0,1] — 1 quality replicated x3 (E0/E1) or 3 qualities stacked (E2)."""
     if len(qualities) not in (1, 3):
-        raise ValueError("qualities doit contenir 1 (répliqué x3) ou 3 qualités")
+        raise ValueError("qualities must contain 1 (replicated x3) or 3 qualities")
     chans = []
     for q in qualities:
         p = os.path.join(cache_dir, f"{doc_id}_q{q}.png")
@@ -120,22 +119,34 @@ def _load_ela_stack(cache_dir, doc_id, qualities):
     return torch.from_numpy(np.stack(chans, axis=0))
 
 
-class SyntheticDevDataset(Dataset):
-    """Dev synthétique falsifié annoté : ELA depuis le cache + masque binaire 384.
+def _docid_to_mask(doc_id):
+    """doc_id `{stem}_{n}` -> mask name `{stem}_mask_{n}.png` (generation schema)."""
+    stem, n = doc_id.rsplit("_", 1)
+    return f"{stem}_mask_{n}.png"
 
-    data_dir  : dossier des MASQUES `{doc_id}_mask.png` (= `masks/` de la génération ;
-                résolution native). Les images vivent dans `images/`, servies via le
-                cache ELA (build_ela_cache), pas lues ici.
-    cache_dir : dossier des PNG ELA {doc_id}_q{q}.png (384, gris) — cf. build_ela_cache
-    qualities : (67,) pour E0/E1 ; (59, 67, 75) pour E2 (≈ Q1) <- ordre = config, ne jamais changer
+
+def _mask_to_docid(fname):
+    """`{stem}_mask_{n}.png` -> doc_id `{stem}_{n}` (== image stem / ELA cache key)."""
+    stem, n = os.path.basename(fname)[:-4].rsplit("_mask_", 1)
+    return f"{stem}_{n}"
+
+
+class SyntheticDevDataset(Dataset):
+    """Annotated synthetic forged dev: ELA from the cache + 384 binary mask.
+
+    data_dir  : folder of MASKS `{stem}_mask_{n}.png` (= generation's `masks/`;
+                native resolution, n = number of forgeries). The images live in
+                `images/` ({stem}_{n}.jpg), served via the ELA cache, not read here.
+    cache_dir : folder of ELA PNGs {doc_id}_q{q}.png (384, grayscale) — cf. build_ela_cache
+    qualities : (67,) for E0/E1; (59, 67, 75) for E2 (≈ Q1) <- order = config, never change
     """
 
     def __init__(self, data_dir, cache_dir, qualities=(67,), img_size=384, doc_ids=None):
         self.cache_dir, self.qualities, self.img_size = cache_dir, tuple(qualities), img_size
         self.data_dir = data_dir
         if doc_ids is None:
-            doc_ids = sorted(os.path.splitext(os.path.basename(p))[0].replace("_mask", "")
-                             for p in glob(os.path.join(data_dir, "*_mask.png")))
+            doc_ids = sorted(_mask_to_docid(p)
+                             for p in glob(os.path.join(data_dir, "*_mask_*.png")))
         self.doc_ids = list(doc_ids)
 
     def __len__(self):
@@ -144,14 +155,14 @@ class SyntheticDevDataset(Dataset):
     def __getitem__(self, idx):
         doc_id = self.doc_ids[idx]
         x = _load_ela_stack(self.cache_dir, doc_id, self.qualities)
-        m = Image.open(os.path.join(self.data_dir, f"{doc_id}_mask.png")).convert("L")
-        m = m.resize((self.img_size, self.img_size), Image.NEAREST)     # NEAREST obligatoire
+        m = Image.open(os.path.join(self.data_dir, _docid_to_mask(doc_id))).convert("L")
+        m = m.resize((self.img_size, self.img_size), Image.NEAREST)     # NEAREST mandatory
         mask = (np.asarray(m) > 127).astype(np.float32)
         return x, torch.from_numpy(mask)
 
 
 class AuthenticELADataset(Dataset):
-    """Documents authentiques (FPR §9.4, Image AUROC). Masque = zéros par construction."""
+    """Authentic documents (FPR §9.4, Image AUROC). Mask = zeros by construction."""
 
     def __init__(self, cache_dir, qualities=(67,), img_size=384, doc_ids=None):
         self.cache_dir, self.qualities, self.img_size = cache_dir, tuple(qualities), img_size
@@ -170,7 +181,7 @@ class AuthenticELADataset(Dataset):
 
 
 def pilot_subset(dataset, n, seed=42):
-    """Sous-échantillon FIXE (mêmes docs à chaque époque) pour le pilotage par époque."""
+    """FIXED subsample (same docs at each epoch) for the per-epoch model selection."""
     if n >= len(dataset):
         return dataset
     rng = np.random.default_rng(seed)
@@ -179,7 +190,7 @@ def pilot_subset(dataset, n, seed=42):
 
 
 # ---------------------------------------------------------------------------
-# 3. Carte d'anomalie — MAE / MSE / SSIM (paramétrable, prépare E4)
+# 3. Anomaly map — MAE / MSE / SSIM (configurable, prepares E4)
 # ---------------------------------------------------------------------------
 
 def _gaussian_kernel(win=11, sigma=1.5, channels=3, device="cpu"):
@@ -202,21 +213,21 @@ def _ssim_map(x, y, win=11, sigma=1.5):
 
 
 def anomaly_map(x, x_hat, mode="mae"):
-    """(B, C, H, W) x2 -> (B, H, W). mode : 'mae' | 'mse' | 'ssim' (E4 tranchera le défaut)."""
+    """(B, C, H, W) x2 -> (B, H, W). mode: 'mae' | 'mse' | 'ssim' (E4 will decide the default)."""
     if mode == "mae":
         return (x - x_hat).abs().mean(dim=1)
     if mode == "mse":
         return ((x - x_hat) ** 2).mean(dim=1)
     if mode == "ssim":
         return (1.0 - _ssim_map(x, x_hat)).clamp(min=0).mean(dim=1)
-    raise ValueError(f"error_mode inconnu : {mode}")
+    raise ValueError(f"unknown error_mode: {mode}")
 
 
 # ---------------------------------------------------------------------------
-# 4. Métriques §9.4
+# 4. Metrics §9.4
 # ---------------------------------------------------------------------------
 
-_MAX_PIXELS = 20_000_000  # sous-échantillonnage pixel (seedé) pour sklearn sur gros volumes
+_MAX_PIXELS = 20_000_000  # pixel subsampling (seeded) for sklearn on large volumes
 
 
 def _flat_subsample(scores, masks, max_pixels=_MAX_PIXELS, seed=0):
@@ -228,20 +239,20 @@ def _flat_subsample(scores, masks, max_pixels=_MAX_PIXELS, seed=0):
 
 
 def pixel_auprc(scores, masks):
-    """PRINCIPALE. Baseline hasard = taux de pixels positifs (pas 0.5)."""
+    """MAIN metric. Chance baseline = positive-pixel rate (not 0.5)."""
     s, m = _flat_subsample(scores, masks)
     return float(average_precision_score(m.astype(np.uint8), s))
 
 
 def pixel_auroc(scores, masks):
-    """INDICATIVE seulement (gonflée par le déséquilibre pixel, §9.4)."""
+    """INDICATIVE only (inflated by the pixel imbalance, §9.4)."""
     s, m = _flat_subsample(scores, masks)
     return float(roc_auc_score(m.astype(np.uint8), s))
 
 
 def aupro(scores, masks, fpr_limit=0.3, num_bins=512):
-    """AUPRO : aire sous (FPR, mean per-region overlap), FPR <= 0.3, normalisée.
-    Implémentation par histogrammes (une passe sur les pixels), approx. à num_bins près."""
+    """AUPRO: area under (FPR, mean per-region overlap), FPR <= 0.3, normalized.
+    Histogram-based implementation (one pass over the pixels), approximate to num_bins."""
     smin, smax = float(scores.min()), float(scores.max())
     if smax <= smin:
         return 0.0
@@ -254,12 +265,12 @@ def aupro(scores, masks, fpr_limit=0.3, num_bins=512):
         lbl, ncomp = ndimage.label(mk)
         for c in range(1, ncomp + 1):
             h = np.histogram(sc[lbl == c], bins=edges)[0]
-            comp_covs.append(np.cumsum(h[::-1])[::-1] / max(h.sum(), 1))  # couverture(seuil)
+            comp_covs.append(np.cumsum(h[::-1])[::-1] / max(h.sum(), 1))  # coverage(threshold)
     if not comp_covs:
         return 0.0
     pro = np.mean(comp_covs, axis=0)                                       # (num_bins,)
     fpr = np.cumsum(neg_hist[::-1])[::-1] / max(neg_hist.sum(), 1)
-    fpr_a, pro_a = fpr[::-1], pro[::-1]                                    # FPR croissant
+    fpr_a, pro_a = fpr[::-1], pro[::-1]                                    # increasing FPR
     sel = fpr_a <= fpr_limit
     if sel.sum() < 2:
         return 0.0
@@ -267,7 +278,7 @@ def aupro(scores, masks, fpr_limit=0.3, num_bins=512):
 
 
 def calibrate_threshold(scores, masks):
-    """§9.3 : seuil = max Dice sur le DEV SYNTHÉTIQUE (jamais sur le test réel). À figer/sauver."""
+    """§9.3: threshold = max Dice on the SYNTHETIC DEV (never on the real test). Freeze/save it."""
     s, m = _flat_subsample(scores, masks)
     prec, rec, thr = precision_recall_curve(m.astype(np.uint8), s)
     dice = 2 * prec * rec / np.clip(prec + rec, 1e-12, None)
@@ -285,22 +296,22 @@ def dice_iou(scores, masks, threshold):
 
 
 def fpr_authentic(auth_scores, threshold):
-    """Pixels flaggés sur documents authentiques (le point industriel critique, E7)."""
+    """Pixels flagged on authentic documents (the critical industrial point, E7)."""
     return float((auth_scores >= threshold).mean())
 
 
 def image_scores(scores, q=0.99):
-    """Score image = quantile q de la carte (plus robuste que max)."""
+    """Image score = quantile q of the map (more robust than max)."""
     return np.quantile(scores.reshape(scores.shape[0], -1), q, axis=1)
 
 
 # ---------------------------------------------------------------------------
-# 5. Boucle d'évaluation
+# 5. Evaluation loop
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
 def _collect(model, loader, device, error_mode):
-    """Retourne (scores (N,H,W) float32, masks (N,H,W) uint8)."""
+    """Returns (scores (N,H,W) float32, masks (N,H,W) uint8)."""
     model.eval()
     all_s, all_m = [], []
     for batch in loader:
@@ -316,11 +327,11 @@ def _collect(model, loader, device, error_mode):
 @torch.no_grad()
 def evaluate(model, dev_loader, device=None, error_mode="mae",
              metrics=("auprc",), threshold=None, authentic_loader=None):
-    """Évalue sur le dev synthétique (et authentiques en option). Retourne un dict.
+    """Evaluate on the synthetic dev (and authentics, optionally). Returns a dict.
 
-    metrics : ("auprc",) pour le pilotage par époque (rapide) — "full" pour la suite §9.4.
-    threshold : None -> calibré sur le dev (§9.3) et retourné dans le dict (à figer ensuite).
-    authentic_loader : requis pour fpr_authentic et image_auroc.
+    metrics : ("auprc",) for the per-epoch model selection (fast) — "full" for §9.4.
+    threshold : None -> calibrated on the dev (§9.3) and returned in the dict (freeze it after).
+    authentic_loader : required for fpr_authentic and image_auroc.
     """
     if device is None:
         device = next(model.parameters()).device
@@ -356,11 +367,11 @@ def evaluate(model, dev_loader, device=None, error_mode="mae",
 
 
 # ---------------------------------------------------------------------------
-# 6. Pilotage best-detection (§9.3bis) + courbe AUPRC vs époques
+# 6. Best-detection model selection (§9.3bis) + AUPRC vs epochs curve
 # ---------------------------------------------------------------------------
 
 class BestDetectionTracker:
-    """Checkpoint = max AUPRC dev (PAS la dernière époque, PAS la loss de reconstruction)."""
+    """Checkpoint = max dev AUPRC (NOT the last epoch, NOT the reconstruction loss)."""
 
     def __init__(self, ckpt_path, history_path=None, patience=None):
         self.ckpt_path, self.history_path, self.patience = ckpt_path, history_path, patience

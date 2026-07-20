@@ -1,16 +1,16 @@
-"""main — point d'entrée du pipeline de génération.
+"""main — entry point of the generation pipeline.
 
-Lance la génération : un sous-dossier complet et autonome par type d'édition.
-Les paramètres proviennent d'un YAML (--config), lui-même généré à partir de
-`config.sh` par les scripts.
+Runs generation: one complete, self-contained subfolder per edit type.
+Parameters come from a YAML (--config), itself generated from `config.sh`
+by the scripts.
 
-Usage recommandé
-----------------
-    ./scripts/run.sh                    # tout vient de config.sh
+Recommended usage
+-----------------
+    ./scripts/run.sh                    # everything comes from config.sh
     ./scripts/run.sh --n 500 --workers 8
 
-Invocation directe (le YAML doit être fourni ou présent) :
-    python python/main.py --config <fichier.yaml> [--src ... --out ... --n ...]
+Direct invocation (the YAML must be provided or present):
+    python python/main.py --config <file.yaml> [--src ... --out ... --n ...]
 """
 
 from __future__ import annotations

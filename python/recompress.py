@@ -1,23 +1,24 @@
-"""recompress — Module 3 du pipeline.
+"""recompress — Pipeline module 3.
 
-Rôle
+Role
 ----
-1. Décoder une JPEG source vers un tableau RGB uint8 (les artefacts de blocking
-   Q0 sont alors *cuits dans les pixels* : c'est cette empreinte que le forger
-   déplacera pour créer l'incohérence).
-2. Resauvegarder l'image finale (fond Q0->Q2 + zone à historique incohérent) en
-   JPEG à la qualité Q2, en **une seule passe**, faux ET négatifs authentiques.
+1. Decode a source JPEG into a uint8 RGB array (the Q0 blocking artifacts are
+   then *baked into the pixels*: this is the fingerprint the forger will
+   displace to create the inconsistency).
+2. Re-save the final image (background Q0->Q2 + region with inconsistent
+   history) as JPEG at quality Q2, in a **single pass**, for both forgeries AND
+   authentic negatives.
 
-RÈGLE IMPÉRATIVE (instruction.md)
----------------------------------
-La zone éditée subit la MÊME passe Q2 que le fond. On ne colle JAMAIS une zone
-après ce save. Concrètement : le forger travaille en espace pixel sur l'image
-DÉCODÉE, puis `save_q2` compresse l'ensemble en un seul appel. Toute la
-cohérence forensique du dataset repose là-dessus.
+MANDATORY RULE (instruction.md)
+-------------------------------
+The edited region undergoes the SAME Q2 pass as the background. We NEVER paste a
+region after this save. Concretely: the forger works in pixel space on the
+DECODED image, then `save_q2` compresses everything in a single call. The whole
+forensic consistency of the dataset rests on this.
 
-Q0 n'est jamais choisi (lu par jpeg_probe). Q2 est le seul paramètre balayé.
+Q0 is never chosen (read by jpeg_probe). Q2 is the only swept parameter.
 
-Dépendances : Pillow + NumPy.
+Dependencies: Pillow + NumPy.
 """
 
 from __future__ import annotations
@@ -33,24 +34,24 @@ from PIL import Image
 from jpeg_probe import estimate_quality, _read_subsampling
 
 
-# Sous-échantillonnage chroma utilisé pour la passe Q2 finale.
-# DÉFAUT = 2 (4:2:0) : c'est le subsampling dominant du corpus SROIE (623/626).
-# Une recompression réaliste (ré-export) utilise le défaut de l'encodeur.
+# Chroma subsampling used for the final Q2 pass.
+# DEFAULT = 2 (4:2:0): this is the dominant subsampling of the SROIE corpus (623/626).
+# A realistic recompression (re-export) uses the encoder default.
 DEFAULT_Q2_SUBSAMPLING = 2  # 0=4:4:4, 1=4:2:2, 2=4:2:0
 
 
 @dataclass
 class SourceImage:
-    """Image source décodée + métadonnées de compression lues dans le fichier."""
-    rgb: np.ndarray          # (H, W, 3) uint8, image décodée
-    q0: int                  # qualité estimée (luma) — LUE, jamais choisie
+    """Decoded source image + compression metadata read from the file."""
+    rgb: np.ndarray          # (H, W, 3) uint8, decoded image
+    q0: int                  # estimated quality (luma) — READ, never chosen
     absdiff: float
     nonstandard: bool
-    subsampling: str         # subsampling du fichier source
-    qtable_luma: list        # table de quantification luma (pour le JSON)
+    subsampling: str         # subsampling of the source file
+    qtable_luma: list        # luma quantization table (for the JSON)
     width: int
     height: int
-    source_id: str           # nom de fichier sans extension
+    source_id: str           # file name without extension
     path: str
 
 
@@ -59,14 +60,14 @@ def decode_source(
     nonstandard_threshold: float = 40.0,
     allow_lossless: bool = False,
 ) -> SourceImage:
-    """Décode une source et lit ses paramètres de compression Q0.
+    """Decode a source and read its Q0 compression parameters.
 
-    JPEG    -> Q0 LU dans la table de quantification (jamais choisi).
-    lossless (PNG, si `allow_lossless=True`) -> pas d'historique JPEG : q0=-1,
-              table vide, subsampling "none". Exploitable UNIQUEMENT en mode Q1
-              contrôlé (le Q1 imposé devient l'unique historique du fond).
+    JPEG     -> Q0 READ from the quantization table (never chosen).
+    lossless (PNG, if `allow_lossless=True`) -> no JPEG history: q0=-1,
+              empty table, subsampling "none". Usable ONLY with a controlled Q1
+              (the imposed Q1 becomes the background's sole history).
 
-    Force le mode RGB pour homogénéiser le pipeline en aval.
+    Forces RGB mode to homogenize the downstream pipeline.
     """
     img = Image.open(path)
     quant = getattr(img, "quantization", None)
@@ -80,10 +81,10 @@ def decode_source(
     elif allow_lossless:
         q0, absdiff, subsampling, qtable_luma, nonstandard = -1, 0.0, "none", [], False
     elif img.format != "JPEG":
-        raise ValueError(f"{path} n'est pas un JPEG (format={img.format}) ; "
-                         f"active allow_lossless pour une source PNG.")
+        raise ValueError(f"{path} is not a JPEG (format={img.format}); "
+                         f"enable allow_lossless for a PNG source.")
     else:
-        raise ValueError(f"{path} n'a pas de table de quantification (Q0 illisible)")
+        raise ValueError(f"{path} has no quantization table (Q0 unreadable)")
 
     rgb = np.asarray(img.convert("RGB"), dtype=np.uint8)
     h, w = rgb.shape[:2]
@@ -107,17 +108,17 @@ def recompress_to_q1(
     q1: int,
     subsampling: int = DEFAULT_Q2_SUBSAMPLING,
 ) -> np.ndarray:
-    """Ré-encode une image en JPEG Q1 puis la re-décode, en mémoire.
+    """Re-encode an image to JPEG Q1 then re-decode it, in memory.
 
-    Rôle (mode Q1 contrôlé — cf. plan.md §Étape 0 : "Q1 et Q2 paramétrables
-    indépendamment, paramètre central pour E5"). Le corpus source SROIE étant
-    quasi sans perte (Q0≈100), une passe unique à Q1 impose un historique de
-    compression EFFECTIF propre au niveau Q1 : c'est cette passe qui devient la
-    grille/quantification de référence du "document original" avant falsification.
+    Role (controlled Q1 — cf. plan.md §Step 0: "Q1 and Q2 independently
+    tunable, central parameter for E5"). Since the SROIE source corpus is
+    near-lossless (Q0≈100), a single Q1 pass imposes an EFFECTIVE compression
+    history specific to the Q1 level: this pass becomes the reference
+    grid/quantization of the "original document" before forgery.
 
-    Le fond du document falsifié aura alors l'historique Q1->Q2 (double
-    compression réellement détectable), au lieu de Q0(≈100)->Q2 (fingerprint
-    faible). Q0 reste LU et journalisé ; Q1 est un paramètre expérimental explicite.
+    The forged document's background then carries the Q1->Q2 history (double
+    compression that is actually detectable), instead of Q0(≈100)->Q2 (weak
+    fingerprint). Q0 stays READ and logged; Q1 is an explicit experimental parameter.
     """
     buf = io.BytesIO()
     Image.fromarray(rgb, mode="RGB").save(
@@ -132,11 +133,11 @@ def save_q2(
     q2: int,
     subsampling: int = DEFAULT_Q2_SUBSAMPLING,
 ) -> None:
-    """Sauve l'image (uint8 RGB) en JPEG qualité Q2, en une seule passe.
+    """Save the image (uint8 RGB) as JPEG at quality Q2, in a single pass.
 
-    C'est l'unique point où une compression est écrite. Utilisé aussi bien pour
-    les faux (fond + zone incohérente déjà composités) que pour les négatifs
-    authentiques (image décodée telle quelle).
+    This is the only point where a compression is written. Used both for
+    forgeries (background + inconsistent region already composited) and for
+    authentic negatives (decoded image as-is).
     """
     if rgb.dtype != np.uint8:
         rgb = np.clip(rgb, 0, 255).astype(np.uint8)

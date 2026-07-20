@@ -1,28 +1,28 @@
-"""lexicon.py — corpus de valeurs plausibles injectées par la substitution.
+"""lexicon.py — corpus of plausible values injected by the substitution.
 
-Le forger peint sur le document une "valeur éditée" (ce qu'un fraudeur écrirait).
-Ce module fournit un GROS corpus varié — français / anglais / dates / chiffres /
-codes / caractères / phrases — pour que le contenu soit **très diversifié**.
+The forger paints an "edited value" on the document (what a fraudster would write).
+This module provides a LARGE, varied corpus — French / English / dates / numbers /
+codes / characters / phrases — so the content is **highly diverse**.
 
-Pourquoi la diversité aide : si toutes les substitutions se ressemblaient (ex. un
-montant en euro), le modèle pourrait apprendre ce CONTENU comme raccourci au lieu du
-signal de compression ELA. En variant fortement le texte injecté, on force le modèle
-à s'appuyer sur l'incohérence de compression, pas sur ce qui est écrit.
+Why diversity helps: if all substitutions looked alike (e.g. a euro amount), the
+model could learn that CONTENT as a shortcut instead of the ELA compression signal.
+By varying the injected text strongly, we force the model to rely on the compression
+inconsistency, not on what is written.
 
-Contrainte technique : le texte est dessiné avec les polices **Hershey d'OpenCV**
-(`cv2.putText`), qui ne rendent **que l'ASCII**. Tout glyphe hors ASCII (ex. '€',
-accents 'é è ç') s'afficherait en '???'. -> `_ascii(...)` translittère tout en ASCII
-(é->e, ç->c, …) à la sortie, donc le corpus source peut contenir des accents sans
-jamais produire de '???'.
+Technical constraint: the text is drawn with OpenCV's **Hershey fonts**
+(`cv2.putText`), which render **ASCII only**. Any non-ASCII glyph (e.g. '€',
+accents 'é è ç') would show as '???'. -> `_ascii(...)` transliterates everything to
+ASCII (é->e, ç->c, …) on output, so the source corpus may contain accents without
+ever producing '???'.
 
-API : `plausible_token(rng, size_class) -> str` (rng = numpy.random.Generator).
+API: `plausible_token(rng, size_class) -> str` (rng = numpy.random.Generator).
 """
 from __future__ import annotations
 
 import string
 import unicodedata
 
-# --- Mots (FR / EN) : vocabulaire de facture / reçu / document commercial --------
+# --- Words (FR / EN): invoice / receipt / commercial-document vocabulary ---------
 _WORDS_FR = [
     "facture", "montant", "total", "client", "date", "quantite", "remise", "solde",
     "paiement", "especes", "carte", "recu", "article", "prix", "taxe", "net", "brut",
@@ -40,7 +40,7 @@ _WORDS_EN = [
     "approved", "cancelled", "duplicate", "receipt", "grand", "nett",
 ]
 
-# --- Phrases courtes (FR / EN) : mentions typiques d'un document -----------------
+# --- Short phrases (FR / EN): typical document mentions ---------------------------
 _PHRASES_FR = [
     "Total a payer", "Merci de votre visite", "Facture acquittee", "Net a payer",
     "Bon pour accord", "Paiement recu", "Sous total", "Remise appliquee", "Montant du",
@@ -56,7 +56,7 @@ _PHRASES_EN = [
     "Have a nice day", "Goods sold are not returnable",
 ]
 
-# --- Noms (personnes / enseignes) : ASCII, multi-origines -----------------------
+# --- Names (people / store names): ASCII, multi-origin --------------------------
 _NAMES = [
     "Martin Dubois", "Jean Leroy", "Sarah Tan", "Ahmad Bin Ali", "Wong Mei",
     "Lee Chong Wei", "Marie Petit", "David Lim", "Nur Aisyah", "Rajesh Kumar",
@@ -64,21 +64,21 @@ _NAMES = [
     "Bar Wang Rice", "Unihakka Intl", "Global Trading", "Sunrise Mart", "Le Comptoir",
 ]
 
-# --- Caractères / marques courtes ------------------------------------------------
+# --- Characters / short marks ----------------------------------------------------
 _MARKS = ["N/A", "OK", "X", "--", "TBD", "VOID", "COPY", "PAID", "n/a", "***",
           "#", "-", "/", "@", "%", "No.", "Ref.", "Qty", "Tel."]
 
-# Mois abrégés (dates style "12 Mar 2018", fréquent sur les reçus)
+# Abbreviated months (dates like "12 Mar 2018", common on receipts)
 _MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
            "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
 
-# Longueur cible (nb de caractères) selon la classe de taille de la zone.
+# Target length (number of characters) by the region's size class.
 _SIZE_NCHARS = {"small": (2, 6), "medium": (4, 9), "large": (6, 13), "very_large": (9, 18)}
 
 
 def _ascii(s: str) -> str:
-    """Translittère en ASCII pur (é->e, ç->c, …) et retire tout reste non-ASCII, pour
-    que cv2.putText (Hershey, ASCII only) ne produise jamais de '???'."""
+    """Transliterate to pure ASCII (é->e, ç->c, …) and drop any non-ASCII remainder, so
+    that cv2.putText (Hershey, ASCII only) never produces '???'."""
     s = unicodedata.normalize("NFKD", s)
     s = s.encode("ascii", "ignore").decode("ascii")
     return "".join(ch for ch in s if 32 <= ord(ch) <= 126)
@@ -88,10 +88,10 @@ def _pick(rng, seq):
     return seq[int(rng.integers(0, len(seq)))]
 
 
-# --- Générateurs procéduraux (diversité infinie) --------------------------------
+# --- Procedural generators (infinite diversity) ---------------------------------
 def _amount(rng, big=False) -> str:
-    """Montant ASCII neutre : milliers ',' + décimale '.' (ex. 12,574.05). Pas de
-    symbole monétaire (le '€' donnait '???' ; on reste neutre en devise)."""
+    """Neutral ASCII amount: thousands ',' + decimal '.' (e.g. 12,574.05). No
+    currency symbol (the '€' gave '???'; we stay currency-neutral)."""
     digits = int(rng.integers(3, 7)) if big else int(rng.integers(1, 4))
     whole = int(rng.integers(1, 10 ** digits))
     return f"{whole:,}.{int(rng.integers(0, 100)):02d}"
@@ -137,7 +137,7 @@ def _phrase(rng) -> str:
     return _pick(rng, _PHRASES_FR if rng.integers(0, 2) == 0 else _PHRASES_EN)
 
 
-# Catégories autorisées par classe de taille (du plus court au plus long).
+# Categories allowed per size class (shortest to longest).
 _BY_SIZE = {
     "small":      ["mark", "int_s", "amount_s", "word", "code"],
     "medium":     ["amount", "date", "word", "code", "int", "mark"],
@@ -147,8 +147,8 @@ _BY_SIZE = {
 
 
 def plausible_token(rng, size_class) -> str:
-    """Valeur plausible ASCII (garantie sans '???') tirée d'un corpus varié
-    FR/EN/date/chiffres/code/caractere/phrase, adaptée à la classe de taille."""
+    """Plausible ASCII value (guaranteed free of '???') drawn from a varied corpus
+    FR/EN/date/numbers/code/character/phrase, adapted to the size class."""
     cats = _BY_SIZE.get(size_class, _BY_SIZE["medium"])
     cat = _pick(rng, cats)
     lo, hi = _SIZE_NCHARS.get(size_class, (3, 8))

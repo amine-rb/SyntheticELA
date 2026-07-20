@@ -1,35 +1,35 @@
-# SyntheticEla — Générateur de falsifications documentaires annotées + évaluation
+# SyntheticEla — Annotated document-forgery dataset generator + evaluation
 
-Génère un dataset **synthétique de falsifications documentaires annotées au pixel**
-à partir de n'importe quel corpus d'images de documents authentiques, et fournit le
-module d'**évaluation détection/localisation** (AnoViT) associé.
+Generates a **pixel-annotated synthetic dataset of document forgeries**
+from any corpus of authentic document images, and ships the associated
+**detection/localization evaluation** module (AnoViT).
 
-Reproduit le scénario forensique de **double compression JPEG** — un fraudeur modifie
-un document déjà enregistré, puis le resauvegarde — et fournit, pour chaque document,
-le masque exact, une grille de labels patch, et les métadonnées.
+Reproduces the forensic scenario of **double JPEG compression** — a fraudster edits
+an already-saved document and then re-saves it — and provides, for each document,
+the exact mask, a patch-label grid, and the metadata.
 
-Interface volontairement minimale : **un seul fichier à éditer (`config.sh`)**,
-**trois commandes à lancer (`scripts/*.sh`)**.
+Deliberately minimal interface: **one file to edit (`config.sh`)**,
+**three commands to run (`scripts/*.sh`)**.
 
 ---
 
-## 0. Organisation du dépôt
+## 0. Repository layout
 
 ```
-config.sh          <- LE seul fichier à éditer (tous les paramètres)
-scripts/           <- LES seules commandes à lancer
-   run.sh          - génération (un sous-dossier autonome par type)
-   aggregate.sh    - fusion des sous-dossiers de types -> _aggregated/
-   ela.sh          - ELA RGB (mêmes paramètres) sur un dossier d'images quelconque
-   _common.sh      - interne (charge config.sh, génère la config, localise python)
-python/            <- code (10 modules ; usage normal = ne pas toucher)
-markdown/          <- plan de recherche, schéma roadmap, notes
+config.sh          <- THE only file to edit (all parameters)
+scripts/           <- THE only commands to run
+   run.sh          - multi-corpus generation + final merged dataset
+   aggregate.sh    - merge a corpus's type subfolders -> _aggregated/
+   ela.sh          - ELA RGB (same parameters) on any image folder
+   _common.sh      - internal (loads config.sh, renders the config, locates python)
+python/            <- code (12 modules; normal usage = don't touch)
+markdown/          <- research plan, roadmap schema, notes
 requirements.txt
-README.md          <- ce fichier
+README.md          <- this file
 ```
 
-Aucun package Python : les modules de `python/` sont des fichiers plats, rendus
-importables via `PYTHONPATH` par les scripts (compatible workers *spawn* macOS).
+No Python package: the modules in `python/` are flat files, made importable
+via `PYTHONPATH` by the scripts (compatible with macOS *spawn* workers).
 
 ---
 
@@ -38,86 +38,107 @@ importables via `PYTHONPATH` par les scripts (compatible workers *spawn* macOS).
 ```bash
 pip install -r requirements.txt   # Pillow, NumPy, OpenCV, PyYAML, PyArrow
 ```
-Pour l'évaluation (§11) uniquement : `pip install torch scikit-learn scipy`.
+For the evaluation (§11) only: `pip install torch scikit-learn scipy`.
 
 ---
 
-## 2. Démarrage rapide
+## 2. Quick start
 
-Deux étapes :
+Two steps:
 
-1. **Édite `config.sh`** — au minimum `SOURCE_DIR` et `OUTPUT_DIR` ; puis `EDIT_TYPES`,
-   `N_DOCS`, `N_FORGERIES`, `MIN_REGION_PX`, `NEGATIVES_RATIO`… **tout** y est.
-2. **Lance** :
+1. **Edit `config.sh`** — organized into 4 sections: **[COMMON]** (including the ELA
+   recipe, identical between generation⇄inference), **[RUN]** (the corpora `RUN_SOURCE_DIRS`/`RUN_OUTPUT_DIRS`,
+   `N_DOCS`, `N_FORGERIES`, `NEGATIVES_RATIO`…), **[ELA]** (defaults for `ela.sh`),
+   **[AGGREGATE]** (defaults for `aggregate.sh`). Each parameter is used only by the
+   script(s) of its section — **everything** is there.
+2. **Run**:
 
 ```bash
-./scripts/run.sh          # génère un sous-dossier autonome par type d'édition
-./scripts/aggregate.sh    # (option) fusionne -> OUTPUT_DIR/_aggregated/
-./scripts/ela.sh --in DOSSIER/IMAGES --out DOSSIER/ELA   # ELA RGB sur un dossier quelconque
+./scripts/run.sh          # generate ALL RUN_* corpora + merge -> RUN_FINAL_DATASET_DIR
+./scripts/aggregate.sh    # (optional) merge a corpus's TYPES -> OUTPUT_DIR/_aggregated/
+./scripts/ela.sh --in FOLDER/IMAGES --out FOLDER/ELA   # ELA RGB on any folder
 ```
 
-Surcharge ponctuelle en CLI, sans éditer `config.sh` :
+**Multi-corpus (new).** `run.sh` loops over the aligned pairs **`(RUN_SOURCE_DIRS[i] →
+RUN_OUTPUT_DIRS[i])`** from `config.sh`: one complete dataset per corpus, **then**
+automatically merges all `dataset.csv` files (all corpora + all types) into a single
+index **`RUN_FINAL_DATASET_DIR/dataset.csv`** (same columns and same values as the
+source CSVs, raw append, without a `corpus` column). `id` there is an integer `0..n-1`
+**local to each source sub-CSV** (see `dataset.csv` below): it **repeats** in the
+merged file (each corpus/type restarts at `0`) — accepted, it is no longer a unique
+key. The provenance of each row (corpus, source `dataset.csv`, `id` within that
+sub-CSV) is tracked separately in `RUN_FINAL_DATASET_DIR/sources.json`. A single
+corpus? A single entry per list. `RUN_FINAL_DATASET_DIR=""` disables the merge.
+
+**`dataset.csv` (training-ready index).** Each type subfolder gets a
+`dataset.csv` in **ABSOLUTE paths**: `id (sequential integer 0..n-1, LOCAL to this
+dataset.csv — NOT the file stem used by images.csv/masks.csv/ela.csv),
+type (source png/jpeg), x_path (ELA = X input), negative (true/false), mask_path (empty
+if negative)`. Self-contained → aggregatable by simple concatenation (but `id` is then
+no longer unique, see above). `aggregate.sh` and `run.sh` carry it over as is.
+
+One-off CLI override, without editing `config.sh`:
 
 ```bash
-./scripts/run.sh --src AUTRE/DOSSIER --out AUTRE/SORTIE --n 500 --workers 8
+./scripts/run.sh --n 500 --workers 8              # applies to ALL RUN_* corpora
 ./scripts/aggregate.sh --types substitution splice --mode symlink
-./scripts/ela.sh --in real_docs/ --out real_docs_ela/ --recursive   # falsifié OU authentique
+./scripts/ela.sh --in real_docs/ --out real_docs_ela/ --recursive   # forged OR authentic
 ```
 
-Sources JPEG **ou** PNG : deux qualités `Q1 < Q2` par document (base puis save
-final ; l'écart crée le signal ELA, §7). Chaque run écrit un **`REPORT.md`** (§6).
+JPEG **or** PNG sources: two qualities `Q1 < Q2` per document (base then final
+save; the gap creates the ELA signal, §7). Each run writes a **`REPORT.md`** (§6).
 
 ---
 
-## 3. Chaîne forensique
+## 3. Forensic pipeline
 
 ```
-source (décodée ; Q0 lu si JPEG, sinon lossless)
-   └─ recompress @Q1         ── "document original" = fond + texte à qualité MOYENNE Q1
-        ├─ POSITIF : forger peint k substitutions (pixels NEUFS, jamais vus par Q1)
-        │       └─ save @Q2   ← fond/texte = Q1→Q2 ; substitution = Q2 seul (Q1<Q2)
-        └─ NÉGATIF : save @Q2 ← tout = Q1→Q2, masque vide
-             └─ annotator : masque exact + bbox + grille patch 24×24 + JSON
+source (decoded; Q0 read if JPEG, else lossless)
+   └─ recompress @Q1         ── "original document" = background + text at MEDIUM quality Q1
+        ├─ POSITIVE : forger paints k substitutions (FRESH pixels, never seen by Q1)
+        │       └─ save @Q2   ← background/text = Q1→Q2; substitution = Q2 only (Q1<Q2)
+        └─ NEGATIVE : save @Q2 ← everything = Q1→Q2, empty mask
+             └─ annotator : exact mask + bbox + 24×24 patch grid + JSON
 ```
 
-Point clé : **deux qualités `Q1 < Q2`** par document. `Q2` (save final, haute) est
-tiré de `QUALITY_SWEEP` ; `Q1 = Q2 − Q1_GAP` (base, moyenne). **C'est l'écart qui
-crée le signal** : le fond et tout le texte **authentique** portent l'historique
-`Q1→Q2`, tandis que la substitution, peinte en pixels **neufs entre les deux
-passes**, n'a subi que `Q2`. Sondée en ELA (à une qualité **≠ `Q2`**), la zone
-n'ayant vu que `Q2` **ressort du texte ordinaire** (mesuré : *forgé/texte-authentique
-≈ 1,8–1,9* avec `Q1` variable — cf. option A, §7). Le négatif subit exactement le même double-passage `Q1→Q2`
-(seule la substitution manque) → ELA propre, **indiscernable du fond d'un positif** :
-aucun indice global, le modèle doit **localiser**.
+Key point: **two qualities `Q1 < Q2`** per document. `Q2` (final save, high) is
+drawn from `QUALITY_SWEEP`; `Q1 = Q2 − Q1_GAP` (base, medium). **It is the gap that
+creates the signal**: the background and all **authentic** text carry the `Q1→Q2`
+history, while the substitution, painted in **fresh pixels between the two
+passes**, only ever saw `Q2`. Probed in ELA (at a quality **≠ `Q2`**), the region
+that only saw `Q2` **stands out from ordinary text** (measured: *forged/authentic-text
+≈ 1.8–1.9* with a varying `Q1` — cf. option A, §7). The negative undergoes exactly the same `Q1→Q2` double pass
+(only the substitution is missing) → clean ELA, **indistinguishable from a positive's background**:
+no global cue, the model must **localize**.
 
-> ⚠️ **L'écart est impératif.** En `Q1 == Q2`, une substitution est *indiscernable
-> du texte authentique* en ELA (ratio mesuré ≈ 1,0 : tout bord de texte s'allume,
-> quel que soit son historique). Le « 3,5× intérieur/extérieur du masque » qu'on
-> mesurait auparavant ne comparait que *texte vs papier blanc* — trompeur. Deux
-> boutons seulement, pas l'ancienne machinerie de régimes : `QUALITY_SWEEP` (les
-> `Q2`) et `Q1_GAP` (l'écart). Et `ELA_QUALITY` doit différer de tout `Q2` du sweep
-> (sinon l'ELA s'effondre à 0 partout — l'orchestrator le refuse).
+> ⚠️ **The gap is mandatory.** Under `Q1 == Q2`, a substitution is *indistinguishable
+> from authentic text* in ELA (measured ratio ≈ 1.0: every text edge lights up,
+> regardless of its history). The "3.5× inside/outside the mask" we used to
+> measure only compared *text vs white paper* — misleading. Only two
+> knobs, not the old regime machinery: `QUALITY_SWEEP` (the
+> `Q2` values) and `Q1_GAP` (the gap). And `ELA_QUALITY` must differ from every `Q2` in the sweep
+> (otherwise ELA collapses to 0 everywhere — the orchestrator refuses it).
 
-Trois types d'édition :
-- **substitution** — écrit une **valeur plausible** (montant, date, quantité, code au
-  format document) à la **taille du texte du document**, en encre sombre, sur du
-  contenu existant ; pas de grille 8×8 antérieure (`alignment = N/A`).
-- **copy_move** — région recopiée de la même image (porte la grille Q1) ; offset ×8 → aligné, sinon désaligné.
-- **splice** — région d'un autre document du corpus (grille étrangère) ; même contrôle d'alignement.
+Three edit types:
+- **substitution** — writes a **plausible value** (amount, date, quantity, code in the
+  document's format) at the **size of the document's text**, in dark ink, over
+  existing content; no prior 8×8 grid (`alignment = N/A`).
+- **copy_move** — region copied from the same image (carries the Q1 grid); offset ×8 → aligned, otherwise misaligned.
+- **splice** — region from another corpus document (foreign grid); same alignment check.
 
 ---
 
-## 4. Falsifications multiples & taille minimale
+## 4. Multiple forgeries & minimum size
 
-**Plusieurs falsifications par document** (`N_FORGERIES=(min max)`). Chaque document
-positif reçoit `k ~ U{min..max}` falsifications du **même type**, aux empreintes
-**disjointes** (pas de chevauchement), et le masque final est leur **union**.
+**Several forgeries per document** (`N_FORGERIES=(min max)`). Each positive
+document gets `k ~ U{min..max}` forgeries of the **same type**, with **disjoint**
+footprints (no overlap), and the final mask is their **union**.
 
-**Plafond de taille automatique selon `k`** : plus il y a de falsifications, plus
-elles sont petites, pour ne jamais couvrir toute la page. Concrètement (4 classes de
-taille ordonnées) :
+**Automatic size cap based on `k`**: the more forgeries there are, the smaller
+they are, so they never cover the whole page. Concretely (4 ordered size
+classes):
 
-| `k` | classes de taille autorisées |
+| `k` | allowed size classes |
 | --- | --- |
 | 1   | small · medium · large · very_large |
 | 2   | small · medium · large |
@@ -125,287 +146,329 @@ taille ordonnées) :
 | 4   | small |
 | 5   | small |
 
-**Taille minimale garantie** (`MIN_REGION_PX=(largeur hauteur)`) : plancher du
-rectangle falsifié quel que soit la classe ou l'image source, arrondi au **multiple de
-8 supérieur** (grille JPEG) — `(10 10)` ⇒ minimum réel `16×16`. Si une source est trop
-petite pour l'accueillir sur un axe, le document **échoue proprement** (erreur
-journalisée par l'orchestrator) au lieu d'écrire un positif à **masque vide**.
+**Guaranteed minimum size** (`MIN_REGION_PX=(width height)`): floor of the
+forged rectangle regardless of the class or source image, rounded up to the **next
+multiple of 8** (JPEG grid) — `(10 10)` ⇒ actual minimum `16×16`. If a source is too
+small to fit it on an axis, the document **fails cleanly** (error
+logged by the orchestrator) instead of writing an **empty-mask** positive.
 
-**Placement sur contenu réel** (`PLACE_ON_CONTENT=true`, `MIN_CONTENT_FRAC`) : les
-falsifications visent une zone portant du **texte/chiffres** (détection d'encre par
-Otsu) au lieu des marges blanches — scénario réaliste (un fraudeur modifie une valeur
-existante) **et** signal ELA exploitable. `MIN_CONTENT_FRAC` = fraction d'encre visée
-(best-effort ; retombe sur le meilleur emplacement si la page est presque vide). Pour
-la substitution, l'**encre** est en outre forcée sombre/contrastée (vrais bords → vrai
-signal), et le splice/copy-move copient une **vraie zone d'encre**. Sans ce placement,
-un aplat sur marge blanche produit une zone quasi invisible en ELA (« trou propre »).
+**Placement on real content** (`PLACE_ON_CONTENT=true`, `MIN_CONTENT_FRAC`): the
+forgeries target a region carrying **text/digits** (Otsu-based ink detection)
+instead of the white margins — a realistic scenario (a fraudster edits an existing
+value) **and** an exploitable ELA signal. `MIN_CONTENT_FRAC` = the targeted ink
+fraction (best-effort; falls back to the best location if the page is nearly empty). For
+substitution, the **ink** is also forced dark/contrasted (real edges → real
+signal), and splice/copy-move copy a **real ink region**. Without this placement,
+a flat fill on a white margin produces a nearly invisible ELA region ("clean hole").
 
-**Substitution réaliste** : la valeur injectée est **plausible** (montant/date/code au
-format document) et rendue à la **taille du texte RÉEL du document** — hauteur des
-glyphes **mesurée** par composantes connexes du masque d'encre (pas une fraction
-devinée), légèrement modulée (`×0,9–1,3`), dans une boîte **serrée** autour du texte.
-Le glyphe injecté fait donc ≈ **1× le corps de texte** du document (~1 % de la hauteur
-de page), au lieu de ~3× auparavant. But : que la détection soit attribuable à
-l'**incohérence de compression** et non à un artefact du générateur (gros texte /
-charabia) — cf. le « tell » du générateur, `markdown/plan.md` §8.
+**Realistic substitution**: the injected value is **plausible** (amount/date/code in the
+document's format) and rendered at the **document's ACTUAL text size** — glyph height
+**measured** via connected components of the ink mask (not a guessed
+fraction), lightly modulated (`×0.9–1.3`), in a **tight** box around the text.
+The injected glyph is therefore ≈ **1× the document's text body** (~1 % of the page
+height), instead of ~3× before. Goal: that the detection is attributable to the
+**compression inconsistency** and not to a generator artifact (large text /
+gibberish) — cf. the generator's "tell", `markdown/plan.md` §8.
 
-> Multi-falsification : `bbox_*` du manifeste est l'**englobante de l'union** des k
-> zones (donc large si elles sont dispersées) ; les rectangles individuels sont dans
-> le JSON, champ `forgery_bboxes`.
+> Multi-forgery: the manifest's `bbox_*` is the **bounding box of the union** of the k
+> regions (thus large if they are scattered); the individual rectangles are in the
+> JSON, field `forgery_bboxes`.
 
-> ELA sur dossier (`ELA_SCALE`) : `./scripts/ela.sh --in … --out …` calcule l'ELA à **échelle globale
-> fixe** (défaut 15, à aligner sur `detection_eval.ELA_SCALE`) au lieu d'un étirement
-> par le max de chaque image — l'aperçu reflète ce que « voit » le modèle et n'écrase
-> plus les fraudes faibles.
+> ELA on a folder (`ELA_SCALE`): `./scripts/ela.sh --in … --out …` computes ELA at a **fixed
+> global scale** (default 15, to align with `detection_eval.ELA_SCALE`) instead of a
+> per-image max stretch — the preview reflects what the model "sees" and no longer
+> washes out weak forgeries.
 
 ---
 
-## 5. Sorties (un sous-dossier AUTONOME par type)
+## 5. Outputs (one SELF-CONTAINED subfolder per type)
 
-Chaque type de `EDIT_TYPES` produit un sous-dossier complet et indépendant (il ne
-manque aucune info pour l'entraînement/évaluation en aval) :
+Each type in `EDIT_TYPES` produces a complete, independent subfolder (it lacks
+no info needed for downstream training/evaluation):
 
 ```
-<out>/distribution.json               # sonde du corpus source (commune à tous les types)
-<out>/<type>/                          # ex. substitution / copy_move / splice
-     images/<type>_<id>.jpg            # document final (fond Q1→Q2 ; zone éditée = Q2 seul)
+<out>/distribution.json               # source corpus probe (shared across all types)
+<out>/<type>/                          # e.g. substitution / copy_move / splice
+     images/<stem>_<n>.jpg             # final document (background Q1→Q2; edited zone = Q2 only) — stem = SOURCE name, n = nb forgeries
      images/images.csv                 # id, image, type, is_negative, quality, size_class, n_forgeries, source_id, seed
-     masks/<type>_<id>_mask.png        # masque binaire pixel EXACT (union des k zones)
-     masks/<type>_<id>.json            # Q0/Q1/Q2, type, taille, alignement, n_forgeries, bboxes, seed, grille 24x24, ela
+     masks/<stem>_mask_<n>.png         # EXACT binary pixel mask (union of the k zones)
+     masks/<stem>_<n>.json             # Q0/Q1/Q2, type, size, alignment, n_forgeries, bboxes, seed, 24x24 grid, ela
      masks/masks.csv                   # id, mask, json, is_negative, n_forgeries, n_mask_px, mask_frac, bbox_*
-     ela/<type>_<id>_ela.png           # ELA RGB (3 qualités ≈ Q1 empilées), résolution native, sur le JPEG final
+     ela/<stem>_ela_<n>.png            # ELA RGB (3 qualities ≈ Q1 stacked), native resolution, on the final JPEG
      ela/ela.csv                       # id, ela, image, ela_qualities, ela_scale, is_negative, type
-     manifest.parquet                  # table du sous-dossier (une ligne par document)
-     distribution.json                 # sonde du corpus (copie, self-contained)
-     run_config.yaml                   # config effective figée
-     REPORT.md                         # rapport lisible des résultats  ← §6
+     manifest.parquet                  # subfolder table (one row per document)
+     distribution.json                 # corpus probe (copy, self-contained)
+     run_config.yaml                   # frozen effective config
+     REPORT.md                         # human-readable results report  ← §6
 ```
 
-> ELA hors pipeline : `./scripts/ela.sh --in <dossier> --out <dossier>` produit `*_ela.png` + `ela.csv`
-> (mêmes qualités ≈ Q1 et échelle que la génération) pour **n'importe quel dossier d'images**, falsifié
-> ou non — utile pour appliquer l'ELA à de vrais documents (Q1 inconnu : voir §7).
+> ELA outside the pipeline: `./scripts/ela.sh --in <folder> --out <folder>` produces `*_ela.png` + `ela.csv`
+> (same ≈ Q1 qualities and scale as the generation) for **any image folder**, forged
+> or not — useful to apply ELA to real documents (Q1 unknown: see §7).
 
-**Trois dossiers, un CSV chacun** (`images/`, `masks/`, `ela/`) : chaque CSV est
-autonome (une ligne par document, nom de fichier + métadonnées) → on charge un
-dossier sans lire le manifeste Parquet. L'**ELA est une sortie de première classe**,
-calculée à la génération sur le **JPEG final re-lu** (l'artefact réel), à résolution
-native et échelle globale fixe (`ELA_SCALE`, alignée sur `detection_eval.ELA_SCALE`)
-→ un fichier ELA par image, **aligné pixel-à-pixel** avec image et masque. L'ELA est
-produite pour **toutes** les images (positifs ET négatifs : l'ELA du négatif est la
-référence « propre »).
+**Three folders, one CSV each** (`images/`, `masks/`, `ela/`): each CSV is
+self-contained (one row per document, file name + metadata) → a folder can be
+loaded without reading the Parquet manifest. **ELA is a first-class output**,
+computed at generation time on the **re-read final JPEG** (the actual artifact), at native
+resolution and fixed global scale (`ELA_SCALE`, aligned with `detection_eval.ELA_SCALE`)
+→ one ELA file per image, **pixel-aligned** with image and mask. ELA is
+produced for **all** images (positives AND negatives: the negative's ELA is the
+"clean" reference).
 
-Les négatifs (authentiques, masque vide) portent le marqueur `authentic` dans leur
-nom (`<type>_authentic_<id>`) : jamais de « falsification » à masque vide.
+**Traceable naming (`stem` = source file name, `n` = number of forgeries).**
+Each artifact keeps the **source document's name** to trace output → source:
+`X0001.jpg` → image `X0001_<n>.jpg`, mask `X0001_mask_<n>.png`, ELA `X0001_ela_<n>.png`,
+JSON `X0001_<n>.json`. A **negative** has `n = 0` (empty mask); a positive with 3 zones has `n = 3`.
+The `id` (= image stem, `<stem>_<n>`) is consistent with `detection_eval` (the mask
+is derived from it) — it is the `id` of `images.csv`/`masks.csv`/`ela.csv`. Sources are
+drawn **without replacement** as long as the corpus is large enough (1 source doc ↔ 1 output); in
+case of forced reuse, a suffix guarantees uniqueness.
 
-Les `id` sont **préfixés par le type** → uniques globalement. `./scripts/aggregate.sh`
-réunit les sous-dossiers choisis dans `<out>/_aggregated/` (même structure — `images/`,
-`masks/`, `ela/` + CSV régénérés —, manifeste concaténé, colonne `type` re-filtrable).
-Options : `--types t1 t2`, `--dest NOM`, `--mode copy|symlink|hardlink`
-(symlink/hardlink = pas de duplication disque).
+**`dataset.csv` has its OWN `id`**, distinct from this one: a sequential integer `0..n-1`
+local to each `dataset.csv` (see §3). When merging (`RUN_FINAL_DATASET_DIR`), each
+sub-CSV restarts at `0` → `id` is **no longer unique** in the final file (no `corpus`
+column added, no global renumbering); the provenance of each range
+is tracked separately in `sources.json` (`corpus`, `source_dir`, `csv`, `ids` = the
+original `id`s, integers too, from that sub-CSV). `./scripts/aggregate.sh`
+gathers the chosen subfolders into `<out>/_aggregated/` (same structure — `images/`,
+`masks/`, `ela/` + regenerated CSVs —, concatenated manifest, re-filterable `type` column).
+Options: `--types t1 t2`, `--dest NAME`, `--mode copy|symlink|hardlink`
+(symlink/hardlink = no disk duplication).
 
-Colonnes du manifeste : `id, source_id, q0, q0_nonstandard, q1_mode, q1_effective,
+Manifest columns: `id, source_id, q0, q0_nonstandard, q1_mode, q1_effective,
 q2, type, size_class, alignment, is_negative, n_forgeries, bbox_x/y/w/h, n_mask_px,
 mask_frac, n_pos_patches, subsampling_src, seed, ela_quality, ela_qualities, ela_scale,
-path_img, path_mask, path_json, path_ela`. (`bbox_*` = englobante de l'union ; les bbox
-individuelles sont dans le JSON, champ `forgery_bboxes`.)
+path_img, path_mask, path_json, path_ela`. (`bbox_*` = bounding box of the union; the individual
+bboxes are in the JSON, field `forgery_bboxes`.)
 
 ---
 
-## 6. `REPORT.md` — les résultats de chaque run
+## 6. `REPORT.md` — each run's results
 
-Généré automatiquement à la fin de chaque génération (regénérable seul :
-`python python/reporter.py --out <SOUS-DOSSIER>`). Il contient :
+Generated automatically at the end of each generation (regeneratable standalone:
+`python python/reporter.py --out <SUBFOLDER>`). It contains:
 
 1. **Source & config** (corpus, seed, `QUALITY_SWEEP`, Q0/dimensions),
-2. **Composition** (types, tailles, alignement, négatifs, qualité `Q`),
-3. **Contrôles d'intégrité** (masques positifs/négatifs cohérents, surface par taille),
-4. **Signal ELA échantillonné** : ratio ELA **forgé / texte authentique**, par type —
-   la vraie mesure « la falsification ressort-elle du texte ordinaire ? » (et non
-   texte-vs-papier, qui est toujours élevé et trompeur seul).
+2. **Composition** (types, sizes, alignment, negatives, quality `Q`),
+3. **Integrity checks** (consistent positive/negative masks, area by size),
+4. **Sampled ELA signal**: ELA **forged / authentic-text** ratio, by type —
+   the real measure of "does the forgery stand out from ordinary text?" (and not
+   text-vs-paper, which is always high and misleading on its own).
 
 ---
 
-## 7. Compression : un écart de qualité `Q1 < Q2` par document
+## 7. Compression: a quality gap `Q1 < Q2` per document
 
-Deux boutons de base : `QUALITY_SWEEP` (les valeurs de `Q2`, save final) et
-`Q1_GAP` (l'écart). Chaque document tire un `Q2` dans le sweep et pose
-`Q1 = Q2 − Q1_GAP` :
+Two basic knobs: `QUALITY_SWEEP` (the `Q2` values, final save) and
+`Q1_GAP` (the gap). Each document draws a `Q2` from the sweep and sets
+`Q1 = Q2 − Q1_GAP`:
 
 ```
-source décodée → recompress @Q1  (le "document original", qualité MOYENNE Q1)
-   → [positif] peindre la substitution (pixels neufs) → save @Q2   (Q1 < Q2)
-   → [négatif]                                          save @Q2
+decoded source → recompress @Q1  (the "original document", MEDIUM quality Q1)
+   → [positive] paint the substitution (fresh pixels) → save @Q2   (Q1 < Q2)
+   → [negative]                                          save @Q2
 ```
 
-- **Fond + texte authentique** : historique `Q1→Q2`. Sondé en ELA **≈ Q1** (leur point
-  fixe) il est **atténué** → **ELA sombre**.
-- **Substitution** : peinte **entre** les deux passes → n'a vu que `Q2`, jamais `Q1` →
-  **ELA vif**, elle **ressort du texte authentique**.
-- **Négatif** : même double-passage `Q1→Q2`, sans substitution → **ELA propre**, fond
-  **identique** à celui d'un positif → pas d'indice global (le modèle localise).
+- **Background + authentic text**: `Q1→Q2` history. Probed in ELA **≈ Q1** (their fixed
+  point) it is **attenuated** → **dark ELA**.
+- **Substitution**: painted **between** the two passes → only saw `Q2`, never `Q1` →
+  **bright ELA**, it **stands out from the authentic text**.
+- **Negative**: same `Q1→Q2` double pass, without substitution → **clean ELA**, background
+  **identical** to a positive's → no global cue (the model localizes).
 
-Un corpus PNG (lossless) est géré nativement : l'historique vient **entièrement** de
-la passe `Q1`.
+A PNG (lossless) corpus is handled natively: the history comes **entirely** from
+the `Q1` pass.
 
-### Qualité de sonde ELA : viser ≈ Q1 (crucial)
+### ELA probe quality: aim ≈ Q1 (crucial)
 
-La sonde ELA (`ELA_QUALITY`) doit viser **≈ Q1** (= médiane(Q2) − `Q1_GAP`), le point
-fixe du fond. C'est ce qui minimise l'ELA du texte authentique et maximise celle de la
-falsification. Mesuré (corpus StaVer, `Q2∈{92,95,97}`, `Q1_GAP=28` → `Q1∈{64,67,69}`),
-**forgé / texte-authentique** selon la sonde :
+The ELA probe (`ELA_QUALITY`) must aim **≈ Q1** (= median(Q2) − `Q1_GAP`), the fixed
+point of the background. That is what minimizes the authentic text's ELA and maximizes the
+forgery's. Measured (StaVer corpus, `Q2∈{92,95,97}`, `Q1_GAP=28` → `Q1∈{64,67,69}`),
+**forged / authentic-text** by probe:
 
-| sonde `ELA_QUALITY` | forgé / **texte-authentique** | luminosité zone |
+| probe `ELA_QUALITY` | forged / **authentic-text** | region brightness |
 | --- | --- | --- |
-| 90 (ancien) | 1.8 | ×1 |
-| **67 (≈ Q1, défaut)** | **3.2** | **×2.5** |
+| 90 (old) | 1.8 | ×1 |
+| **67 (≈ Q1, default)** | **3.2** | **×2.5** |
 
-L'écart `Q1_GAP` compte aussi (à sonde ≈ Q1) : 22→~2.5, **28→~3.2**, 32→plafonne.
-En `Q1==Q2` : **≈ 1.0** ❌ (indiscernable, aucun signal).
+The `Q1_GAP` gap also matters (at a probe ≈ Q1): 22→~2.5, **28→~3.2**, 32→plateaus.
+Under `Q1==Q2`: **≈ 1.0** ❌ (indistinguishable, no signal).
 
-### `Q1_GAP` peut être une PLAGE — robustesse au Q1 d'inférence (option A)
+### `Q1_GAP` can be a RANGE — robustness to the inference Q1 (option A)
 
-`Q1_GAP` accepte un **scalaire** (Q1 quasi fixe, ancien comportement) **ou une plage
-`(min max)`** : un gap est alors tiré **par document**, donc `Q1 = Q2 − gap` **varie
-sur toute une bande**. Ex. `QUALITY_SWEEP=(90 93 96)`, `Q1_GAP=(20 40)` → `Q1 ∈ [50, 76]`.
+`Q1_GAP` accepts a **scalar** (nearly fixed Q1, old behavior) **or a range
+`(min max)`**: a gap is then drawn **per document**, so `Q1 = Q2 − gap` **varies
+over a whole band**. E.g. `QUALITY_SWEEP=(90 93 96)`, `Q1_GAP=(20 40)` → `Q1 ∈ [50, 76]`.
 
-Pourquoi : un modèle entraîné sur un `Q1` unique (67) le **surapprend** et échoue sur
-un document reçu à l'inférence dont la qualité de base diffère. Faire varier `Q1` dans
-les **données** force le modèle à généraliser.
+Why: a model trained on a single `Q1` (67) **overfits** it and fails on
+an inference document whose base quality differs. Varying `Q1` in the
+**data** forces the model to generalize.
 
-> **Non-évident (mesuré).** Ne **pas** élargir la sonde ELA pour « couvrir » la plage
-> de `Q1`. Une sonde **étroite fixe** (`67/8` → 59/67/75) reste la meilleure même à
-> `Q1 ∈ [50, 80]` (grille : `67/8`→2,04 · `65/15`→1,74), car la fraude (Q2 seul)
-> ressort à **beaucoup** de qualités de sonde, pas seulement à `Q1` pile. La robustesse
-> vient de la diversité de `Q1` **dans les données**, pas de la sonde. Avec `Q1` varié :
-> forgé/texte-authentique ≈ **1,8–2,4** (vs ~3,2 à `Q1` unique parfaitement sondé — le
-> compromis robustesse/pic attendu).
+> **Non-obvious (measured).** Do **not** widen the ELA probe to "cover" the `Q1`
+> range. A **fixed narrow** probe (`67/8` → 59/67/75) stays best even at
+> `Q1 ∈ [50, 80]` (grid: `67/8`→2.04 · `65/15`→1.74), because the forgery (Q2 only)
+> shows up at **many** probe qualities, not only at `Q1` exactly. Robustness
+> comes from `Q1` diversity **in the data**, not from the probe. With a varied `Q1`:
+> forged/authentic-text ≈ **1.8–2.4** (vs ~3.2 at a single perfectly-probed `Q1` — the
+> expected robustness/peak trade-off).
 
-> **Périmètre (limite structurelle).** L'ELA détecte une fraude par **re-compression**
-> (double JPEG). Un document **jamais double-compressé** (save unique, image vierge)
-> n'a **aucune discontinuité d'historique** → il n'est **pas** détectable par cette
-> méthode. Ce n'est pas un bug : c'est le domaine de validité de l'ELA.
+> **Scope (structural limit).** ELA detects a **re-compression** forgery
+> (double JPEG). A document **never double-compressed** (single save, pristine image)
+> has **no history discontinuity** → it is **not** detectable by this
+> method. This is not a bug: it is ELA's validity domain.
 
-### Réduire les faux positifs colorés (logos / tampons / cachets)
+### Reducing colored false positives (logos / stamps / seals)
 
-Le mobilier authentique **coloré** (logos, tampons) s'allume en ELA **aussi fort qu'une
-fraude** (mesuré ELA ≈ 74 vs 82) : c'est le faux positif dominant. Or une substitution
-est du **texte noir** (chroma ≈ 3) alors que ces éléments sont **colorés** (chroma ≈ 40)
-→ la **couleur** est le discriminant, utilisé **en négatif**. Deux boutons **cumulables**
-dans `compute_ela_stack` (valides **tant que la fraude est achromatique** ; à désactiver
-si l'on falsifie du coloré) :
+Authentic **colored** furniture (logos, stamps) lights up in ELA **as strongly as a
+forgery** (measured ELA ≈ 74 vs 82): it is the dominant false positive. But a substitution
+is **black text** (chroma ≈ 3) whereas these elements are **colored** (chroma ≈ 40)
+→ **color** is the discriminator, used **in the negative**. Two **cumulative** knobs
+in `compute_ela_stack` (valid **as long as the forgery is achromatic**; disable
+if forging colored regions):
 
-- **`ELA_GRAYSCALE_INPUT`** (true/false) — passe l'image en **gris avant** l'ELA. Un
-  logo coloré a d'énormes bords **par canal** ; le gris les moyenne → l'ELA du coloré
-  **clair** s'effondre (74→~8), la fraude noire garde ~99 %. La sortie RGB survit (ses
-  3 canaux viennent des 3 **qualités**, pas de la couleur de l'image).
-- **`ELA_CHROMA_SUPPRESS`** (défaut 20 ; 0=off) — pondère l'ELA par
-  `w = clip(1 − chroma/seuil, 0, 1)`, chroma mesurée sur l'**original couleur** même si
-  l'ELA est en gris → efface les pixels colorés **quelle que soit leur luminosité**
-  (rattrape le coloré **foncé** que le gris seul laisse passer).
+- **`ELA_GRAYSCALE_INPUT`** (true/false) — grayscales the image **before** ELA. A
+  colored logo has huge **per-channel** edges; grayscaling averages them → the **light**
+  colored furniture's ELA collapses (74→~8), the black forgery keeps ~99 %. The RGB output survives (its
+  3 channels come from the 3 **qualities**, not the image color).
+- **`ELA_CHROMA_SUPPRESS`** (default 20; 0=off) — weights the ELA by
+  `w = clip(1 − chroma/threshold, 0, 1)`, chroma measured on the **original color** image even if
+  the ELA is grayscale → erases colored pixels **regardless of their luminance**
+  (catches the **dark** colored furniture that grayscale alone leaves behind).
 
-Cumulés (gris → chroma) : logo/tampon → 0, fraude ~86 %, ratio forgé/texte-auth
-1,79 → 1,93. Ces mêmes flags s'appliquent aussi à `scripts/ela.sh`
+Cumulated (gray → chroma): logo/stamp → 0, forgery ~86 %, forged/authentic-text ratio
+1.79 → 1.93. These same flags also apply to `scripts/ela.sh`
 (`--grayscale-input` / `--chroma-suppress`).
 
-### ELA de sortie = image COULEUR RGB (3 qualités)
+### ELA output = RGB COLOR image (3 qualities)
 
-`ela/*.png` est une **image RGB** : les 3 canaux sont l'ELA à 3 qualités encadrant `Q1`
-(`ELA_QUALITY ± ELA_SPREAD` = 59/67/75). La couleur vient de la **diversité de qualité**
-(pas de la chroma — mesurée anti-corrélée ici). La zone falsifiée, vive dans les 3 sondes,
-ressort en **blanc/teinté** ; le texte authentique reste sombre. Cela donne **3 canaux
-d'info** au modèle (= mode E2 de `detection_eval`).
+`ela/*.png` is an **RGB image**: the 3 channels are the ELA at 3 qualities bracketing `Q1`
+(`ELA_QUALITY ± ELA_SPREAD` = 59/67/75). The color comes from **quality diversity**
+(not chroma — measured anti-correlated here). The forged region, bright in all 3 probes,
+stands out as **white/tinted**; the authentic text stays dark. This gives the model **3 channels
+of info** (= `detection_eval`'s E2 mode).
 
-> **Deux règles impératives.** (1) `Q1 < Q2` (`Q1_GAP > 0`) — sinon la falsification est
-> indiscernable du texte réel (ratio ≈ 1,0). (2) les 3 qualités ELA ≠ tout `Q2` du sweep
-> — sinon l'ELA **s'effondre à 0** (image au point fixe de la sonde ; l'orchestrator le
-> refuse). L'orchestrator affiche la sonde recommandée (≈ Q1) et alerte si tu t'en
-> éloignes. `copy_move`/`splice` restent générables mais plus faibles (zone déjà porteuse
-> d'un historique JPEG) : ce pipeline vise la substitution.
+> **Two mandatory rules.** (1) `Q1 < Q2` (`Q1_GAP > 0`) — otherwise the forgery is
+> indistinguishable from real text (ratio ≈ 1.0). (2) the 3 ELA qualities ≠ every `Q2` in the sweep
+> — otherwise ELA **collapses to 0** (image at the probe's fixed point; the orchestrator
+> refuses it). The orchestrator prints the recommended probe (≈ Q1) and warns if you
+> stray from it. `copy_move`/`splice` remain generatable but weaker (region already carrying
+> a JPEG history): this pipeline targets substitution.
 
 ---
 
 ## 8. Configuration (`config.sh`)
 
-**Tous** les paramètres sont là (variables shell commentées) — seul fichier à éditer.
+`config.sh` is the **only** file to edit. It is deliberately **minimal — one
+comment per parameter**; the *why* of each setting lives here (§8) and in
+§7 (compression/ELA). It is organized into 4 sections, each parameter belonging
+to the script(s) that read it:
 
-| Variable(s) | Rôle |
+- **[COMMON]** — read by `run.sh`, `ela.sh` **and** `aggregate.sh`. Contains the **ELA
+  recipe**, placed here because it **must be identical between generation and inference**
+  (otherwise the model sees an out-of-distribution input).
+- **[RUN]** — dataset generation (`run.sh`).
+- **[ELA]** — defaults for inference ELA (`ela.sh`).
+- **[AGGREGATE]** — defaults for merging types (`aggregate.sh`).
+
+### Complete reference
+
+| Variable(s) | Section | Role |
+| --- | --- | --- |
+| `PYTHON` | COMMON | Python interpreter (the one with the dependencies) — absolute path if no venv active |
+| `ELA_QUALITY`, `ELA_SPREAD` | COMMON | ELA probe: center ≈ Q1 + spread → 3 RGB channels (here 52/60/68) (§7). **Identical generation⇄inference**; **fixed and narrow** probe even at varying Q1; the 3 channels **≠ every `Q2`** in the sweep (otherwise ELA→0) |
+| `ELA_SCALE` | COMMON | **fixed global** ELA scale (no per-image max stretch, which would wash out weak forgeries). Aligned with `detection_eval.ELA_SCALE` (=15) |
+| `ELA_GRAYSCALE_INPUT`, `ELA_CHROMA_SUPPRESS` | COMMON | colored-false-positive suppression (logos/stamps): grayscale before ELA + chroma suppression after (§7). **OFF if `SUBST_COLOR_PROB>0`** (otherwise the colored forgery is erased too) |
+| `PROBE_RECURSIVE`, `CANDIDATE_EXT`, `ALLOW_LOSSLESS` | COMMON | reading a folder: recursive descent, accepted extensions, lossless support (PNG/TIFF/BMP, without Q0) |
+| `NONSTANDARD_ABSDIFF_THRESHOLD` | COMMON | threshold for detecting a "non-standard" quantization table at the probe |
+| `RUN_SOURCE_DIRS`, `RUN_OUTPUT_DIRS` | RUN | **aligned** (input, output) lists — one corpus per entry; `run.sh` loops over them (same length required) |
+| `RUN_CORPUS_NAMES` | RUN | names (aligned) for the `corpus` label in `sources.json`; `()` → derived from the path |
+| `RUN_FINAL_DATASET_DIR` | RUN | folder for the **merged** `dataset.csv` (all corpora + types, without a `corpus` column) + `sources.json` (provenance); `""` → no merge |
+| `QUALITY_SWEEP` | RUN | `Q2` values (final save, high) drawn per document (§7) — **all ≠ ELA channels**. Wide range (72…96) = generalization to re-saves of varied qualities |
+| `Q1_GAP` | RUN | compression gap: `Q1 = Q2 − Q1_GAP` (§7) — **the signal knob**; scalar (fixed Q1) **or range `(min max)`** → Q1 varies per doc (option A). Useful floor ≈ 15 (below that the gap is too small) |
+| `EDIT_TYPES` | RUN | generated types — **one subfolder per type** (aim for `substitution`) |
+| `ALIGNED_RATIO` | RUN | fraction of zones aligned on the 8×8 grid (for `copy_move` / `splice`) |
+| `FEATHER_RADIUS_PX` | RUN | `(min max)` edge-feathering radius (anti-tell) |
+| `SPLICE_SOURCE` | RUN | origin of the `splice` donor (`intra_corpus` = another doc from the same corpus) |
+| `MIN_REGION_PX` | RUN | `(width height)` guaranteed min zone size, rounded up to the next multiple of 8 (§4) |
+| `N_FORGERIES` | RUN | `(min max)` forgeries per doc — automatic size cap when k is large (§4). Enters the **file name** (§5) |
+| `PLACE_ON_CONTENT`, `MIN_CONTENT_FRAC` | RUN | place the forgeries on real content (ink), with a minimum ink fraction under the zone (§4) |
+| `SUBST_COLOR_PROB` | RUN | fraction of substitutions **in color** (random hue) vs black; `0`=all black. If `>0`, ELA color filters OFF (§7) |
+| `SIZE_SMALL … SIZE_VERY_LARGE` | RUN | zone size classes (page fraction, `min max`) |
+| `NEGATIVES_RATIO` | RUN | fraction of authentics per subfolder (high for an anomaly training set, ~0.5 for a test set) |
+| `KEEP_BENIGN_COLORED` | RUN | preserve benign colored furniture (logos/stamps/headers) from real documents |
+| `INPUT_RES`, `PATCH_SIZE`, `PATCH_GRID`, `PATCH_POSITIVE_OVERLAP` | RUN | ground-truth patch grid (24×24 on 384, patch positive if overlap > threshold) |
+| `ELA_N_SAMPLES` | RUN | number of QA panels `image \| ELA \| mask` |
+| `SEED`, `N_DOCS`, `N_WORKERS` | RUN | reproducibility, batch **per type and per corpus**, parallelism; `N_DOCS=""` → as many documents as source images (y=x) |
+| `ELA_INPUT_DIR`, `ELA_OUTPUT_DIR`, `ELA_RECURSIVE` | ELA | defaults for `ela.sh` when `--in/--out` are absent; `""` → 1st RUN corpus and `<output>/_ela_scan` |
+| `AGG_OUTPUT_DIR`, `AGG_TYPES`, `AGG_MODE`, `AGG_DEST` | AGG | defaults for `aggregate.sh`: corpus to merge (`""`→`RUN_OUTPUT_DIRS[0]`), types (`()`=all), mode `copy\|symlink\|hardlink`, subfolder name |
+
+**Measured values (reference).** ELA probe on `Q1∈[40,81], Q2∈[72,96]` (50 docs,
+color filter OFF), **forged/authentic-text** ratio: `[52,60,68]` → **3.89**
+(best) · `[53,65,77]` → 3.86 · `[59,67,75]` (old) → 3.69 — hence the center `60`.
+Widening the probe **serves no purpose** (the Q2-only forgery shows up at many qualities,
+not only at Q1): robustness to the inference Q1 comes from **Q1 diversity
+in the data** (gap drawn per doc), not from a wide probe (cf. §7).
+
+CLI overrides (without editing `config.sh`): `--src`, `--out`, `--n`, `--workers`
+(applied to all corpora); for `ela.sh`: `--in`, `--out`, `--recursive`.
+
+---
+
+## 9. Code (`python/`, one file per module)
+
+| Module | Role |
 | --- | --- |
-| `SOURCE_DIR`, `OUTPUT_DIR` | corpus source & racine de sortie |
-| `CANDIDATE_EXT`, `ALLOW_LOSSLESS` | extensions acceptées, prise en charge lossless (PNG) |
-| `QUALITY_SWEEP` | valeurs de `Q2` (save final, hautes) tirées par document (§7) — **toutes ≠ `ELA_QUALITY`** |
-| `Q1_GAP` | écart de compression : `Q1 = Q2 − Q1_GAP` (§7) — **le bouton du signal** ; scalaire (Q1 fixe) **ou plage `(min max)`** → Q1 varie par doc (option A), défaut `(20 40)` |
-| `EDIT_TYPES` | types générés — **un sous-dossier par type** (viser `substitution`) |
-| `N_FORGERIES` | `(min max)` falsifications par doc — plafond de taille auto (§4) |
-| `MIN_REGION_PX` | `(largeur hauteur)` taille min garantie de zone (§4) |
-| `PLACE_ON_CONTENT`, `MIN_CONTENT_FRAC` | placer les fraudes sur du contenu réel (§4) |
-| `SUBST_COLOR_PROB` | fraction des substitutions rendues **en couleur** (teinte aléatoire) vs noir ; `0`=tout noir. Si `>0`, mettre le filtre couleur ELA à OFF (§7) sinon la fraude colorée est effacée |
-| `ALIGNED_RATIO`, `FEATHER_RADIUS_PX` | alignement grille 8×8, adoucissement anti-tell |
-| `SIZE_SMALL … SIZE_VERY_LARGE` | tailles de zone (fraction de page, min max) |
-| `NEGATIVES_RATIO` | part d'authentiques par sous-dossier (`0.0` = que des fraudes) |
-| `INPUT_RES`, `PATCH_SIZE`, `PATCH_GRID`, `PATCH_POSITIVE_OVERLAP` | grille patch |
-| `ELA_QUALITY`, `ELA_SPREAD` | sonde ELA : centre ≈ Q1 + écart des 3 canaux RGB (§7) — sonde **fixe étroite** même à Q1 variable |
-| `ELA_GRAYSCALE_INPUT`, `ELA_CHROMA_SUPPRESS` | anti-faux-positifs colorés : gris avant l'ELA + suppression chroma après (§7) |
-| `ELA_N_SAMPLES`, `ELA_SCALE` | nb de planches QA ; échelle ELA globale fixe |
-| `SEED`, `N_DOCS`, `N_WORKERS` | reproductibilité, lot **par type**, parallélisme |
-| `PYTHON` | interpréteur (celui qui a les dépendances) |
-
-Surcharges CLI (sans éditer `config.sh`) : `--src`, `--out`, `--n`, `--workers`.
+| `jpeg_probe`  | Probes Q0 / quant table / subsampling / dimensions (or marks lossless) → `distribution.json`. |
+| `recompress`  | Decodes the source; `recompress_to_q1` (base @Q); `save_q2` (final save @Q, same quality). |
+| `forger`      | substitution / copy_move / splice; multi-forgery; anti-tell feather; guaranteed min size. |
+| `lexicon`     | Corpus of plausible values (FR/EN/date/number/code/phrase) injected by the substitution; ASCII-only (Hershey fonts). |
+| `annotator`   | Exact mask, bbox, 24×24 patch grid, JSON metadata. |
+| `orchestrator`| Scriptable batch, one self-contained subfolder per type, deterministic seeds, per-doc `Q1`/`Q2` draw, manifest + per-folder CSVs including `dataset.csv` (absolute paths). |
+| `aggregate`   | Merges a corpus's **type** subfolders into a single dataset (`_aggregated/`). |
+| `build_dataset` | Merges the `dataset.csv` files from **several corpora** into a single index + `sources.json` (provenance, without a `corpus` column) — called by `run.sh`. |
+| `reporter`    | `REPORT.md` (run results + ELA separability). |
+| `ela_scan`    | ELA RGB 3 qualities ≈ Q1 (same parameters as the output) on any image folder, forged or not. |
+| `main`        | Entry point called by `run.sh`. |
+| `detection_eval` | AnoViT detection/localization evaluation (§11) — to copy into the training codebase. |
 
 ---
 
-## 9. Code (`python/`, un fichier par module)
+## 10. Reproducibility
 
-| Module | Rôle |
-| --- | --- |
-| `jpeg_probe`  | Sonde Q0 / table quant / subsampling / dimensions (ou marque lossless) → `distribution.json`. |
-| `recompress`  | Décode la source ; `recompress_to_q1` (base @Q) ; `save_q2` (save final @Q, même qualité). |
-| `forger`      | substitution / copy_move / splice ; multi-falsification ; feather anti-tell ; taille min garantie. |
-| `annotator`   | Masque exact, bbox, grille patch 24×24, métadonnées JSON. |
-| `orchestrator`| Batch scriptable, un sous-dossier autonome par type, seeds déterministes, tirage `Q1`/`Q2` par doc, manifeste. |
-| `aggregate`   | Fusionne les sous-dossiers de types en un dataset unique (`_aggregated/`). |
-| `reporter`    | `REPORT.md` (résultats du run + séparabilité ELA). |
-| `ela_scan`    | ELA RGB 3 qualités ≈ Q1 (mêmes paramètres que la sortie) sur un dossier d'images quelconque, falsifié ou non. |
-| `main`        | Point d'entrée appelé par `run.sh`. |
-| `detection_eval` | Évaluation détection/localisation AnoViT (§11) — à copier dans le codebase d'entraînement. |
+- Global seed → **deterministic seed per document** (logged). Output **identical**
+  regardless of the number of workers (each job forges with its own seed).
+- Each type gets a decorrelated random stream → no exact duplicates between
+  subfolders at aggregation.
+- `run_config.yaml` freezes the effective config (including the resolved `Q1_GAP` range) of each batch.
 
 ---
 
-## 10. Reproductibilité
+## 11. Detection/localization evaluation (`python/detection_eval.py`)
 
-- Seed global → **seed déterministe par document** (journalisé). Sortie **identique**
-  quel que soit le nombre de workers (chaque job forge avec son propre seed).
-- Chaque type reçoit un flux aléatoire décorrélé → aucun doublon exact entre
-  sous-dossiers à l'agrégation.
-- `run_config.yaml` fige la config effective (dont la plage `Q1_GAP` résolue) de chaque lot.
+Standalone module to **copy into AnoViT's training codebase**. Implements the
+protocol from the thesis (see `markdown/plan.md` §9.3 threshold, §9.3bis steering, §9.4
+metrics). Additional dependencies: `torch, scikit-learn, scipy`.
 
----
-
-## 11. Évaluation détection/localisation (`python/detection_eval.py`)
-
-Module autonome à **copier dans le codebase d'entraînement** d'AnoViT. Implémente le
-protocole du mémoire (voir `markdown/plan.md` §9.3 seuil, §9.3bis pilotage, §9.4
-métriques). Dépendances supplémentaires : `torch, scikit-learn, scipy`.
-
-**Cache ELA (une fois, hors entraînement).** Le dossier `ela/` généré contient l'ELA
-RGB (3 qualités ≈ Q1) à résolution native ; l'entraînement construit son propre cache
-**384** via `build_ela_cache`, recalculé depuis les **images** (`images/`) : ELA
-résolution native → échelle globale fixe → resize 384 → PNG gris (jamais JPEG). **Viser
-≈ Q1** (≈ 67 par défaut), PAS 90. Une passe sert E0/E1 (1 qualité, 67) et E2 (3, encadrant Q1) :
+**ELA cache (once, outside training).** The generated `ela/` folder contains the ELA
+RGB (3 qualities ≈ Q1) at native resolution; training builds its own **384**
+cache via `build_ela_cache`, recomputed from the **images** (`images/`): native-resolution
+ELA → fixed global scale → resize 384 → grayscale PNG (never JPEG). **Aim
+≈ Q1** (≈ 67 by default), NOT 90. A single pass serves E0/E1 (1 quality, 67) and E2 (3, bracketing Q1):
 
 ```python
 from detection_eval import build_ela_cache
 build_ela_cache("<out>/_aggregated/images", "cache/dev",  qualities=(59, 67, 75))  # ≈ Q1
-build_ela_cache("chemin/authentiques",      "cache/auth", qualities=(59, 67, 75))
+build_ela_cache("path/authentics",          "cache/auth", qualities=(59, 67, 75))
 ```
 
-**Loaders + pilotage best-detection (§9.3bis).**
+**Loaders + best-detection steering (§9.3bis).**
 
 ```python
 from torch.utils.data import DataLoader
 from detection_eval import (SyntheticDevDataset, AuthenticELADataset,
                             pilot_subset, evaluate, BestDetectionTracker)
 
-dev_ds  = SyntheticDevDataset("<out>/_aggregated/masks", "cache/dev", qualities=(67,))  # ≈Q1 ; 1er arg = dossier masks/
+dev_ds  = SyntheticDevDataset("<out>/_aggregated/masks", "cache/dev", qualities=(67,))  # ≈Q1; 1st arg = masks/ folder
 dev_ld  = DataLoader(pilot_subset(dev_ds, 400, seed=42), batch_size=48, num_workers=8)
 tracker = BestDetectionTracker("experiments/E0/best_model.pt",
                                history_path="experiments/E0/auprc_curve.json", patience=15)
@@ -413,19 +476,150 @@ tracker = BestDetectionTracker("experiments/E0/best_model.pt",
 for epoch in range(100):
     train_one_epoch(model, train_loader)
     res = evaluate(model, dev_ld, error_mode="mae", metrics=("auprc",))
-    tracker.update(epoch, res["pixel_auprc"], model)     # checkpoint = max AUPRC dev
+    tracker.update(epoch, res["pixel_auprc"], model)     # checkpoint = max dev AUPRC
     if tracker.should_stop:
         break
 ```
 
-**Évaluation finale (§9.4)** — dev complet, seuil calibré sur le dev (max Dice),
-**figé** puis repassé une seule fois au test réel :
+**Final evaluation (§9.4)** — full dev, threshold calibrated on the dev (max Dice),
+**frozen** then run once on the real test:
 
 ```python
 res = evaluate(model, dev_full, error_mode="mae", metrics="full", authentic_loader=auth_ld)
 # {pixel_auprc, aupro, threshold, dice, iou, fpr_authentic, image_auroc, pixel_auroc}
 ```
 
-Pièges : ne jamais binariser les scores avant `evaluate` (AUPRC/AUPRO ont besoin des
-scores continus) ; garder le même `seed` pour le sous-échantillon pilote ; calibrer le
-seuil sur le dev, jamais sur le test.
+Pitfalls: never binarize the scores before `evaluate` (AUPRC/AUPRO need the
+continuous scores); keep the same `seed` for the pilot subset; calibrate the
+threshold on the dev, never on the test.
+
+
+
+❯ comment je trouve sur internet des données authentique images jpeg                                                                       
+
+⏺ Pour ce pipeline, « authentique » = de vrais documents scannés/photographiés, à compression unique — donc authentiques par construction.
+  Tu n'as pas besoin de vérifier quoi que ce soit si tu prends des corpus documentaires académiques connus. Voici où chercher.
+
+  Les corpus documentaires standard (authentiques par nature)
+
+  ┌──────────────┬────────────────────────┬─────────────┬────────────────────────────────────┐
+  │   Dataset    │        Contenu         │   Format    │                 Où                 │
+  ├──────────────┼────────────────────────┼─────────────┼────────────────────────────────────┤
+  │ SROIE 2019   │ reçus scannés          │ JPEG        │ ICDAR / Kaggle (tu l'as déjà)      │
+  ├──────────────┼────────────────────────┼─────────────┼────────────────────────────────────┤
+  │ CORD         │ reçus (restaurants)    │ JPEG/PNG    │ HuggingFace naver-clova-ix/cord-v2 │
+  ├──────────────┼────────────────────────┼─────────────┼────────────────────────────────────┤
+  │ FUNSD        │ formulaires scannés    │ PNG         │ guillaumejaume.github.io/FUNSD     │
+  ├──────────────┼────────────────────────┼─────────────┼────────────────────────────────────┤
+  │ RVL-CDIP     │ 400k docs de bureau    │ TIFF (gris) │ HuggingFace aharley/rvl_cdip       │
+  ├──────────────┼────────────────────────┼─────────────┼────────────────────────────────────┤
+  │ DocLayNet    │ docs multi-domaines    │ PNG         │ HuggingFace ds4sd/DocLayNet        │
+  ├──────────────┼────────────────────────┼─────────────┼────────────────────────────────────┤
+  │ Tobacco3482  │ docs industriels       │ JPEG        │ Kaggle                             │
+  ├──────────────┼────────────────────────┼─────────────┼────────────────────────────────────┤
+  │ IAM / StaVer │ manuscrit / signatures │ PNG         │ (StaVer = ton 2e corpus)           │
+  └──────────────┴────────────────────────┴─────────────┴────────────────────────────────────┘
+
+  Où chercher en général
+
+  1. HuggingFace Datasets → filtre par tâche Document, OCR. Le plus pratique (téléchargement direct, licences visibles).
+  2. Kaggle → cherche « invoice », « receipt », « scanned documents », « forms ». Vérifie l'onglet License.
+  3. ICDAR / concours académiques (RRC, robust reading) → jeux de docs réels, bien documentés.
+  4. Roboflow Universe → beaucoup de docs annotés, export facile.
+
+  Le critère qui compte
+
+  - ✅ Vrais scans/photos de documents = authentiques, une seule compression. C'est ce que tu veux.
+  - ❌ Évite les collections d'images retravaillées, screenshots, ou dossiers tampered/.
+
+  Note sur le format JPEG
+
+  Tu demandes du JPEG spécifiquement, mais rappel : le format n'est pas une contrainte ici. run.sh recompresse toujours le fond en Q1→Q2,
+  donc l'historique vient de ce passage-là, pas du format source. Un corpus PNG marche tout aussi bien (le CLAUDE.md le dit). Ne te
+  restreins pas au JPEG si un bon corpus PNG/TIFF est disponible.
+
+  Attention licences
+
+  Pour de la recherche master, prends des licences CC / recherche / academic use (SROIE, FUNSD, RVL-CDIP le sont). Vérifie avant d'inclure
+  dans ton rapport.
+
+  Si tu veux, dis-moi le type de documents que tu vises (factures ? reçus ? formulaires médicaux ? — ta config mentionne bills,
+  discharge_summaries) et je te sors les 2-3 corpus les plus adaptés avec leurs liens exacts.
+
+✻ Brewed for 29s
+
+❯ trouvve moi 10 dataset a utiliser pour entrainer mon modele                                                                              
+
+⏺ Je vais chercher les liens actuels pour te donner 10 corpus vérifiés et adaptés à ton pipeline (documents authentiques : factures, reçus,
+  formulaires).
+
+⏺ Web Search("SROIE FUNSD CORD RVL-CDIP document image dataset download huggingface")
+  ⎿  Did 1 search in 7s
+  ⎿  Allowed by auto mode classifier
+
+⏺ Web Search("scanned invoice receipt document dataset public download research 2025")
+  ⎿  Did 1 search in 7s
+  ⎿  Allowed by auto mode classifier
+
+⏺ Web Search("DocLayNet Tobacco3482 PubLayNet document image dataset huggingface download")
+  ⎿  Did 1 search in 9s
+  ⎿  Allowed by auto mode classifier
+
+⏺ Voici 10 corpus de vrais documents scannés — donc authentiques par construction (compression unique, aucune forgerie pré-existante),
+  exactement ce qu'il te faut comme source pour run.sh.
+
+  Les 10 datasets
+
+  ┌─────┬───────────────────────┬──────────────────────────────────┬──────────┬───────────────┬──────────────────────────────────────┐
+  │  #  │        Dataset        │             Contenu              │  Format  │    Taille     │                Accès                 │
+  ├─────┼───────────────────────┼──────────────────────────────────┼──────────┼───────────────┼──────────────────────────────────────┤
+  │ 1   │ SROIE 2019            │ reçus scannés                    │ JPEG     │ ~1000         │ HF darentang/sroie / Kaggle (tu l'as │
+  │     │                       │                                  │          │               │  déjà)                               │
+  ├─────┼───────────────────────┼──────────────────────────────────┼──────────┼───────────────┼──────────────────────────────────────┤
+  │ 2   │ CORD-v2               │ reçus resto/boutiques            │ PNG/JPEG │ ~1000         │ HF naver-clova-ix/cord-v2            │
+  ├─────┼───────────────────────┼──────────────────────────────────┼──────────┼───────────────┼──────────────────────────────────────┤
+  │ 3   │ FUNSD                 │ formulaires bruités scannés      │ PNG      │ 199           │ HF nielsr/funsd                      │
+  │     │                       │                                  │          │ formulaires   │                                      │
+  ├─────┼───────────────────────┼──────────────────────────────────┼──────────┼───────────────┼──────────────────────────────────────┤
+  │ 4   │ RVL-CDIP              │ docs de bureau (16 classes)      │ TIFF     │ 400 000       │ HF aharley/rvl_cdip                  │
+  │     │                       │                                  │ gris     │               │                                      │
+  ├─────┼───────────────────────┼──────────────────────────────────┼──────────┼───────────────┼──────────────────────────────────────┤
+  │ 5   │ RVL-CDIP (invoice)    │ sous-ensemble factures           │ TIFF     │ ~invoices     │ HF chainyo/rvl-cdip-invoice          │
+  ├─────┼───────────────────────┼──────────────────────────────────┼──────────┼───────────────┼──────────────────────────────────────┤
+  │ 6   │ DocLayNet             │ docs                             │ PNG      │ 80 863 pages  │ HF ds4sd/DocLayNet                   │
+  │     │                       │ finance/science/légal/brevets    │          │               │                                      │
+  ├─────┼───────────────────────┼──────────────────────────────────┼──────────┼───────────────┼──────────────────────────────────────┤
+  │ 7   │ PubLayNet             │ articles scientifiques           │ PNG      │ >300k pages   │ HF shunk031/PubLayNet                │
+  ├─────┼───────────────────────┼──────────────────────────────────┼──────────┼───────────────┼──────────────────────────────────────┤
+  │ 8   │ Tobacco3482           │ docs industriels/légaux          │ JPEG     │ 3 482         │ Kaggle « tobacco3482 »               │
+  ├─────┼───────────────────────┼──────────────────────────────────┼──────────┼───────────────┼──────────────────────────────────────┤
+  │ 9   │ Denoising Dirty       │ pages de texte scannées          │ PNG      │ ~200          │ Kaggle                               │
+  │     │ Documents             │                                  │          │               │                                      │
+  ├─────┼───────────────────────┼──────────────────────────────────┼──────────┼───────────────┼──────────────────────────────────────┤
+  │ 10  │ BuDDIE                │ documents business multi-tâches  │ image    │ récent (2024) │ arXiv 2404.04003 / repo associé      │
+  └─────┴───────────────────────┴──────────────────────────────────┴──────────┴───────────────┴──────────────────────────────────────┘
+
+  Recommandations pour ton cas
+
+  Ta config vise des factures / documents médicaux (bills, discharge_summaries) :
+
+  - Meilleurs choix directs : SROIE (1), Tobacco3482 (8), RVL-CDIP invoice (5) — vrais scans JPEG, exactement le domaine.
+  - Gros volume pour le train d'anomalie : RVL-CDIP (4) et DocLayNet (6) te donnent des dizaines de milliers de pages « normales ».
+  - Le format n'est pas bloquant : PNG/TIFF marchent aussi bien que JPEG — run.sh recompresse toujours en Q1→Q2, l'historique vient de là
+  (pas du format source). Ne te limite pas au JPEG.
+
+  2 règles à respecter
+
+  1. Corpus disjoints entre train et test — n'utilise pas le même dataset pour le train (ratio=1) et le test (ratio~0.5), sinon fuite. Ex.
+  : train sur RVL-CDIP + DocLayNet, test sur SROIE + Tobacco3482.
+  2. Licences — SROIE, FUNSD, RVL-CDIP, DocLayNet, PubLayNet sont en usage recherche/CC ; vérifie et cite-les dans ton rapport master.
+
+  Sources
+
+  - aharley/rvl_cdip (Hugging Face)
+  - chainyo/rvl-cdip-invoice (Hugging Face)
+  - ds4sd/DocLayNet (Hugging Face)
+  - DS4SD/DocLayNet (GitHub)
+  - shunk031/PubLayNet (Hugging Face)
+  - BuDDIE: A Business Document Dataset (arXiv 2404.04003)
+  - A Survey on Scanned Receipts OCR (SROIE/CORD/FUNSD overview)
