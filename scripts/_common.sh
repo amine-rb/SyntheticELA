@@ -87,6 +87,7 @@ gen_config() {
         echo "  ela_scale: ${ELA_SCALE}"
         echo "  chroma_suppress: ${ELA_CHROMA_SUPPRESS}"
         echo "  grayscale_input: ${ELA_GRAYSCALE_INPUT}"
+        echo "  join: ${JOIN:-false}"
 
         echo "orchestrator:"
         echo "  seed: ${SEED}"

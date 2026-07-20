@@ -144,6 +144,36 @@ def compute_ela_stack(img_path: str, qualities: list[int], scale: float,
     return np.clip(ela, 0, 255).astype(np.uint8)        # (H, W, 3) RGB
 
 
+def join_board(img_rgb: np.ndarray, ela_rgb: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """Stitch [image | ELA | mask] side-by-side into ONE (H, W*3, 3) RGB board.
+
+    A per-document visual QA image (written to join/ when `ela.join` is on): lets a
+    human eyeball at a glance whether the ELA lights up the forged zone and whether the
+    mask covers it. Purely diagnostic — never read by the model. All three inputs are
+    already pixel-aligned (native, or the same square when RESIZE_384). The mask (1
+    channel) is promoted to 3 channels; a thin white separator + a labelled header bar
+    are drawn on each panel.
+    """
+    h, w = img_rgb.shape[:2]
+    panels = [("image", img_rgb),
+              ("ELA", ela_rgb),
+              ("mask", cv2.cvtColor(mask, cv2.COLOR_GRAY2RGB))]
+    bar = max(18, h // 30)                       # header height, scales with the doc
+    sep = 3                                       # white gap between panels
+    fs = max(0.4, h / 900.0)                      # font scale, scales with the doc
+    out = []
+    for i, (label, panel) in enumerate(panels):
+        p = np.ascontiguousarray(panel, dtype=np.uint8)
+        canvas = np.full((h + bar, w, 3), 255, np.uint8)
+        canvas[bar:, :, :] = p
+        cv2.putText(canvas, label, (6, bar - 6), cv2.FONT_HERSHEY_SIMPLEX,
+                    fs, (0, 0, 0), 1, cv2.LINE_AA)
+        out.append(canvas)
+        if i < len(panels) - 1:
+            out.append(np.full((h + bar, sep, 3), 255, np.uint8))
+    return np.concatenate(out, axis=1)
+
+
 def _bn(rel: Optional[str]) -> str:
     """Filename from a relative path (empty if None)."""
     return os.path.basename(rel) if rel else ""
@@ -521,6 +551,14 @@ def _run_job(job: Job, cfg: dict, out_dirs: dict, nonstd_thr: float) -> dict:
     ela_path = os.path.join(out_dirs["ela"], f"{job.stem}_ela_{n}.png")
     Image.fromarray(ela_rgb, "RGB").save(ela_path)      # RGB: channels = (q_low, q_mid, q_high)
 
+    # ---- Optional join/ QA board: [image | ELA | mask] side-by-side (visual check) ----
+    join_path = None
+    if bool(ela_cfg.get("join", False)) and out_dirs.get("join"):
+        final_rgb = np.asarray(Image.open(img_path).convert("RGB"), dtype=np.uint8)  # exactly what is delivered
+        board = join_board(final_rgb, ela_rgb, mask)
+        join_path = os.path.join(out_dirs["join"], f"{job.stem}_join_{n}.png")
+        Image.fromarray(board, "RGB").save(join_path)
+
     # ---- 24x24 patch grid ----
     labels, fracs = ann.patch_grid_labels(
         mask, input_res=ann_cfg.get("input_res", 384),
@@ -714,8 +752,12 @@ def run(cfg: dict, limit: Optional[int] = None, workers: Optional[int] = None) -
         sub_dirs = {"root": sub_root,
                     "images": os.path.join(sub_root, "images"),
                     "masks": os.path.join(sub_root, "masks"),
-                    "ela": os.path.join(sub_root, "ela")}
-        for _k in ("images", "masks", "ela"):
+                    "ela": os.path.join(sub_root, "ela"),
+                    "join": os.path.join(sub_root, "join")}
+        _dirs = ["images", "masks", "ela"]
+        if bool(cfg.get("ela", {}).get("join", False)):
+            _dirs.append("join")
+        for _k in _dirs:
             os.makedirs(sub_dirs[_k], exist_ok=True)
         # Effective config of the subfolder: self-describing (scalar edit_type).
         sub_cfg = {

@@ -62,7 +62,7 @@ SIZE_MEDIUM=(0.005 0.02)                      # 0.5% – 2%
 SIZE_LARGE=(0.02 0.06)                        # 2% – 6%
 SIZE_VERY_LARGE=(0.06 0.15)                   # 6% – 15%
 
-NEGATIVES_RATIO=0                            # fraction of authentics/subfolder (high=anomaly train, ~0.5=test)
+NEGATIVES_RATIO=1                            # fraction of authentics/subfolder (high=anomaly train, ~0.5=test)
 KEEP_BENIGN_COLORED=true                      # preserve logos/stamps/headers
 
 INPUT_RES=384                                 # input resolution of the downstream model
@@ -72,9 +72,10 @@ PATCH_GRID=24                                 # patch grid (24x24)
 PATCH_POSITIVE_OVERLAP=0.5                    # patch positive if overlap > threshold
 
 ELA_N_SAMPLES=50                              # number of QA boards image | ELA | mask
+JOIN=true                                     # extra join/ subfolder: image | ELA | mask stitched side-by-side per doc (visual check)
 
 SEED=42                                       # global seed (reproducibility)
-N_DOCS=5                                     # docs PER TYPE and PER corpus; "" = as many as source images (y=x, one forgery/image); else an integer y (y<x = subsample, y>x = sources reused with a different forgery)
+N_DOCS=15                                    # docs PER TYPE and PER corpus; "" = as many as source images (y=x, one forgery/image); else an integer y (y<x = subsample, y>x = sources reused with a different forgery)
 N_WORKERS=4                                   # parallelism
 
 

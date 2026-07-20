@@ -104,6 +104,76 @@ def build_ela_cache(data_dir, cache_dir, qualities=(59, 67, 75),
 
 
 # ---------------------------------------------------------------------------
+# 1b. Inference preprocessing: ANY image (forged or not) -> model-ready tensor
+#     THE single function to call at inference. MUST use the SAME recipe
+#     (qualities, scale, chroma, grayscale, img_size) as generation/training,
+#     else the model receives a different input distribution. Self-contained
+#     port of orchestrator.compute_ela_stack + the square resize.
+# ---------------------------------------------------------------------------
+
+def _to_rgb_u8(image):
+    """Accept a path (str), PIL.Image, or ndarray -> (H, W, 3) uint8 RGB."""
+    if isinstance(image, str):
+        return np.asarray(Image.open(image).convert("RGB"), np.uint8)
+    if isinstance(image, Image.Image):
+        return np.asarray(image.convert("RGB"), np.uint8)
+    arr = np.asarray(image)
+    if arr.ndim == 2:
+        arr = np.stack([arr] * 3, axis=-1)
+    return np.ascontiguousarray(arr[..., :3]).astype(np.uint8)
+
+
+def compute_ela_rgb(image, qualities=(52, 60, 68), scale=ELA_SCALE,
+                    chroma_suppress=0.0, grayscale_input=False):
+    """Self-contained RGB ELA (== orchestrator.compute_ela_stack), NATIVE resolution.
+
+    (H, W, 3) uint8. Channel k = |img - JPEG(img, q_k)| averaged over RGB, x scale.
+    The 3 channels are the 3 probe QUALITIES (color = quality diversity, not chroma).
+    grayscale_input / chroma_suppress: the two colored-false-positive reducers, off by
+    default. The JPEG recompress uses PIL, identical to generation -> byte-parity when
+    the two reducers are off (config.sh defaults)."""
+    orig = _to_rgb_u8(image)
+    if grayscale_input:
+        g = np.asarray(Image.fromarray(orig).convert("L"))
+        img = np.stack([g, g, g], axis=-1).astype(np.int16)
+    else:
+        img = orig.astype(np.int16)
+    chans = []
+    for q in qualities:
+        buf = io.BytesIO()
+        Image.fromarray(img.astype(np.uint8), "RGB").save(buf, "JPEG", quality=int(q))
+        buf.seek(0)
+        rec = np.asarray(Image.open(buf).convert("RGB"), np.int16)
+        chans.append(np.abs(img - rec).mean(axis=2))
+    ela = np.stack(chans, axis=2).astype(np.float32) * float(scale)
+    if chroma_suppress and chroma_suppress > 0:
+        ycc = np.asarray(Image.fromarray(orig).convert("YCbCr"), np.float32)   # Y, Cb, Cr
+        chroma = np.sqrt((ycc[..., 1] - 128.0) ** 2 + (ycc[..., 2] - 128.0) ** 2)
+        ela *= np.clip(1.0 - chroma / float(chroma_suppress), 0.0, 1.0)[..., None]
+    return np.clip(ela, 0, 255).astype(np.uint8)
+
+
+def ela_input(image, qualities=(52, 60, 68), img_size=384, scale=ELA_SCALE,
+              chroma_suppress=0.0, grayscale_input=False, device=None):
+    """Image (path / PIL / ndarray, forged or not) -> ELA RGB (native) -> square resize
+    -> (1, 3, img_size, img_size) float32 [0,1] tensor, ready for `model(x)`.
+
+    THE inference preprocessing. Pass the SAME parameters used at generation/training
+    (config.sh: qualities = ELA_QUALITY ± ELA_SPREAD, scale = ELA_SCALE, chroma =
+    ELA_CHROMA_SUPPRESS, grayscale = ELA_GRAYSCALE_INPUT, img_size = INPUT_RES).
+    Resize matches generation (cv2.INTER_LINEAR if OpenCV is available, else PIL
+    BILINEAR)."""
+    ela = compute_ela_rgb(image, qualities, scale, chroma_suppress, grayscale_input)
+    try:
+        import cv2                                                # exact match to generation
+        ela = cv2.resize(ela, (img_size, img_size), interpolation=cv2.INTER_LINEAR)
+    except ImportError:
+        ela = np.asarray(Image.fromarray(ela, "RGB").resize((img_size, img_size), Image.BILINEAR))
+    x = torch.from_numpy(ela.astype(np.float32).transpose(2, 0, 1) / 255.0).unsqueeze(0)
+    return x.to(device) if device is not None else x
+
+
+# ---------------------------------------------------------------------------
 # 2. Evaluation datasets
 # ---------------------------------------------------------------------------
 
