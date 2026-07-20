@@ -48,6 +48,7 @@ Final eval (full dev, §9.4):
 
 from __future__ import annotations
 
+import csv
 import io
 import json
 import os
@@ -60,7 +61,7 @@ import torch.nn.functional as F
 from PIL import Image
 from scipy import ndimage
 from sklearn.metrics import average_precision_score, precision_recall_curve, roc_auc_score
-from torch.utils.data import Dataset, Subset
+from torch.utils.data import DataLoader, Dataset, Subset
 
 # ---------------------------------------------------------------------------
 # 1. ELA cache precompute (once, outside training)
@@ -178,6 +179,56 @@ class AuthenticELADataset(Dataset):
     def __getitem__(self, idx):
         x = _load_ela_stack(self.cache_dir, self.doc_ids[idx], self.qualities)
         return x, torch.zeros(self.img_size, self.img_size)
+
+
+def _is_negative(v):
+    return str(v).strip().lower() in ("true", "1", "yes", "y", "t")
+
+
+class CSVELADataset(Dataset):
+    """Dev/test driven by a flat CSV manifest instead of the folder+cache layout.
+
+    Columns (dataset.csv): `id, type, x_path, negative, mask_path`, where
+      x_path    : path to the PRECOMPUTED ELA RGB image (generation's `ela/*_ela.png`,
+                  3 qualities ≈ Q1 stacked as channels) — loaded as-is, so NO ELA cache
+                  is built here (skip build_ela_cache entirely for this path).
+      negative  : truthy -> authentic doc (mask forced to zeros, mask_path ignored).
+      mask_path : native-resolution binary mask for a forged doc (NEAREST -> img_size).
+
+    only : None (all rows) | 'forged' (negative falsy) | 'authentic' (negative truthy).
+           Split a single manifest into the two loaders `evaluate` expects.
+
+    NOTE: x must match the ELA representation the model was TRAINED on (here RGB 384,
+    /255). Adjust the normalization line if training used a different mean/std.
+    """
+
+    def __init__(self, csv_path, img_size=384, only=None):
+        self.img_size = img_size
+        with open(csv_path, newline="") as f:
+            rows = list(csv.DictReader(f))
+        if only == "forged":
+            rows = [r for r in rows if not _is_negative(r["negative"])]
+        elif only == "authentic":
+            rows = [r for r in rows if _is_negative(r["negative"])]
+        elif only is not None:
+            raise ValueError("only must be None | 'forged' | 'authentic'")
+        self.rows = rows
+
+    def __len__(self):
+        return len(self.rows)
+
+    def __getitem__(self, idx):
+        r = self.rows[idx]
+        ela = Image.open(r["x_path"]).convert("RGB").resize(
+            (self.img_size, self.img_size), Image.BILINEAR)          # already 384 -> no-op
+        x = torch.from_numpy(np.asarray(ela, np.float32).transpose(2, 0, 1) / 255.0)
+        if _is_negative(r["negative"]) or not r.get("mask_path"):
+            mask = torch.zeros(self.img_size, self.img_size)
+        else:
+            m = Image.open(r["mask_path"]).convert("L").resize(
+                (self.img_size, self.img_size), Image.NEAREST)       # NEAREST mandatory
+            mask = torch.from_numpy((np.asarray(m) > 127).astype(np.float32))
+        return x, mask
 
 
 def pilot_subset(dataset, n, seed=42):
@@ -364,6 +415,30 @@ def evaluate(model, dev_loader, device=None, error_mode="mae",
             s = np.r_[image_scores(scores), image_scores(auth_scores)]
             res["image_auroc"] = float(roc_auc_score(y, s))
     return res
+
+
+@torch.no_grad()
+def evaluate_from_csv(model, csv_path, device=None, error_mode="mae",
+                      metrics="full", threshold=None, img_size=384,
+                      batch_size=48, num_workers=8):
+    """One-call eval from a CSV manifest (cf. CSVELADataset). Splits the manifest
+    into forged (negative falsy) and authentic (negative truthy) loaders and calls
+    evaluate(). If the manifest has no authentic rows, image_auroc/fpr_authentic are
+    skipped (localization metrics still computed).
+
+    VAL/TEST discipline: on the val manifest leave threshold=None (calibrated, returned
+    in the dict); on the test manifest pass that frozen value as `threshold=`."""
+    def _loader(only):
+        ds = CSVELADataset(csv_path, img_size=img_size, only=only)
+        return ds, DataLoader(ds, batch_size=batch_size, num_workers=num_workers)
+
+    forged_ds, forged_ld = _loader("forged")
+    auth_ds, auth_ld = _loader("authentic")
+    if len(forged_ds) == 0:
+        raise ValueError(f"{csv_path}: no forged rows (negative falsy) to evaluate")
+    return evaluate(model, forged_ld, device=device, error_mode=error_mode,
+                    metrics=metrics, threshold=threshold,
+                    authentic_loader=auth_ld if len(auth_ds) else None)
 
 
 # ---------------------------------------------------------------------------
